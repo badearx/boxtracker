@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>BoxTracker</title>
+    <meta name="theme-color" content="#0a0a0a" />
+    <link rel="manifest" href="./manifest.webmanifest">
+    <style>
+      html,body,#root{height:100%;margin:0}
+      body{background:#0a0a0a;color:#f5f5f5;font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial}
+      button{cursor:pointer}
+    </style>
+    <!-- React + Babel (no build tools needed) -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+      // ===== IndexedDB helpers =====
+      const DB_NAME = 'boxtracker_db';
+      const DB_VERSION = 1;
+      const STORE = 'boxes';
+      function openDB(){
+        return new Promise((resolve,reject)=>{
+          const req = indexedDB.open(DB_NAME, DB_VERSION);
+          req.onupgradeneeded = ()=>{
+            const db = req.result;
+            if(!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE,{keyPath:'id'});
+          };
+          req.onsuccess = ()=>resolve(req.result);
+          req.onerror = ()=>reject(req.error);
+        });
+      }
+      async function dbGetAll(){
+        const db = await openDB();
+        return new Promise((resolve,reject)=>{
+          const tx = db.transaction(STORE,'readonly');
+          const s = tx.objectStore(STORE);
+          const r = s.getAll();
+          r.onsuccess = ()=>resolve(r.result||[]);
+          r.onerror = ()=>reject(r.error);
+        });
+      }
+      async function dbPut(item){
+        const db = await openDB();
+        return new Promise((resolve,reject)=>{
+          const tx = db.transaction(STORE,'readwrite');
+          const s = tx.objectStore(STORE);
+          const r = s.put(item);
+          r.onsuccess = ()=>resolve(true);
+          r.onerror = ()=>reject(r.error);
+        });
+      }
+      async function dbDelete(id){
+        const db = await openDB();
+        return new Promise((resolve,reject)=>{
+          const tx = db.transaction(STORE,'readwrite');
+          const s = tx.objectStore(STORE);
+          const r = s.delete(id);
+          r.onsuccess = ()=>resolve(true);
+          r.onerror = ()=>reject(r.error);
+        });
+      }
+
+      // ===== Utilities =====
+      const uid = ()=> Math.random().toString(36).slice(2)+Date.now().toString(36);
+      const Placeholder = () => `data:image/svg+xml;utf8,${encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 800 450'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#1f1f1f'/><stop offset='100%' stop-color='#2a2a2a'/></linearGradient></defs><rect width='800' height='450' fill='url(#g)'/><text x='50%' y='50%' fill='#666' font-size='32' text-anchor='middle' dominant-baseline='middle' font-family='system-ui'>No photo</text></svg>")}`;
+      const fileToDataUrl = (file)=> new Promise((res,rej)=>{ const rd=new FileReader(); rd.onload=()=>res(rd.result); rd.onerror=()=>rej(rd.error); rd.readAsDataURL(file); });
+
+      // ===== Styles (inline JS objects) =====
+      const btnPrimary = { padding:'10px 14px', borderRadius:12, background:'#6d28d9', color:'#fff', fontWeight:600, border:'1px solid #5b21b6' };
+      const btnGhost   = { padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a', fontWeight:500 };
+      const btnGhostSm = { ...btnGhost, padding:'8px 10px', fontSize:13 };
+      const btnPrimarySm = { ...btnPrimary, padding:'8px 10px', fontSize:13 };
+      const btnDangerSm = { ...btnGhostSm, border:'1px solid #7f1d1d' };
+      const inputStyle = { width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', outline:'none', color:'#f5f5f5' };
+      const textareaStyle = { ...inputStyle, minHeight:96, resize:'vertical' };
+      const removeBadge = { position:'absolute', top:6, right:6, background:'rgba(0,0,0,0.6)', border:'1px solid #2a2a2a', color:'#f5f5f5', borderRadius:8, padding:'2px 8px', fontSize:12 };
+
+      // ===== React App =====
+      function App(){
+        const [boxes,setBoxes] = React.useState([]);
+        const [query,setQuery] = React.useState('');
+        const [sheetOpen,setSheetOpen] = React.useState(false);
+        const [editing,setEditing] = React.useState(null);
+        const [busy,setBusy] = React.useState(false);
+
+        React.useEffect(()=>{ (async()=>{ const all = await dbGetAll(); all.sort((a,b)=>b.updatedAt-a.updatedAt); setBoxes(all); })(); },[]);
+
+        async function saveBox(item){
+          const now = Date.now();
+          const payload = { ...item, updatedAt: now, id: item.id || uid(), createdAt: item.createdAt || now };
+          await dbPut(payload);
+          setBoxes(prev=>{ const exists = prev.some(x=>x.id===payload.id); const next = exists ? prev.map(x=>x.id===payload.id?payload:x) : [payload,...prev]; next.sort((a,b)=>b.updatedAt-a.updatedAt); return next; });
+        }
+        async function removeBox(id){ await dbDelete(id); setBoxes(prev=>prev.filter(x=>x.id!==id)); }
+
+        const filtered = React.useMemo(()=>{
+          if(!query.trim()) return boxes;
+          const q = query.toLowerCase();
+          return boxes.filter(b=> [b.title,b.description,b.location,b.category].filter(Boolean).some(t=> String(t).toLowerCase().includes(q)) );
+        },[boxes,query]);
+
+        function onCreate(){ setEditing({ id: uid(), title:'', description:'', location:'', category:'', images:[], createdAt: Date.now(), updatedAt: Date.now() }); setSheetOpen(true); }
+        function onEdit(item){ setEditing(JSON.parse(JSON.stringify(item))); setSheetOpen(true); }
+
+        function exportJSON(){ try{ setBusy(true); const blob = new Blob([JSON.stringify(boxes,null,2)],{type:'application/json'}); const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download = `BoxTracker_Backup_${new Date().toISOString().slice(0,10)}.json`; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); } finally{ setBusy(false); } }
+        async function importJSON(file){ try{ setBusy(true); const text = await file.text(); const imported = JSON.parse(text); if(!Array.isArray(imported)) throw new Error('Invalid backup format'); for(const box of imported) await dbPut(box); const all = await dbGetAll(); all.sort((a,b)=>b.updatedAt-a.updatedAt); setBoxes(all); alert('Import complete.'); } catch(e){ alert('Import failed: '+(e&&e.message?e.message:e)); } finally{ setBusy(false); } }
+
+        return (
+          <div style={{minHeight:'100vh', background:'#0a0a0a', color:'#f5f5f5'}}>
+            <TopBar query={query} setQuery={setQuery} onCreate={onCreate} onExport={exportJSON} onImport={importJSON} busy={busy} />
+            <div style={{maxWidth:960, margin:'0 auto', padding:16, paddingBottom:96}}>
+              {filtered.length===0 ? <EmptyState onCreate={onCreate}/> : (
+                <div style={{display:'grid', gap:12}}>
+                  {filtered.map(b=> <BoxCard key={b.id} item={b} onEdit={()=>onEdit(b)} onDelete={()=>removeBox(b.id)} />)}
+                </div>
+              )}
+            </div>
+            {sheetOpen && editing && (
+              <EditorSheet item={editing} onClose={()=>{ setSheetOpen(false); setEditing(null); }} onSave={async(v)=>{ await saveBox(v); setSheetOpen(false); setEditing(null); }} />
+            )}
+          </div>
+        );
+      }
+
+      function TopBar({query,setQuery,onCreate,onExport,onImport,busy}){
+        const fileRef = React.useRef(null);
+        return (
+          <div style={{position:'sticky', top:0, zIndex:20, backdropFilter:'blur(8px)', background:'rgba(15,15,15,0.9)', borderBottom:'1px solid #262626'}}>
+            <div style={{maxWidth:960, margin:'0 auto', padding:'12px 16px', display:'flex', alignItems:'center', gap:12}}>
+              <span style={{fontWeight:700}}>BoxTracker</span>
+              <div style={{flex:1}} />
+              <button onClick={onCreate} style={btnPrimary}>New</button>
+              <button onClick={onExport} disabled={busy} style={btnGhost}>{busy?'Exporting…':'Export'}</button>
+              <button onClick={()=> fileRef.current && fileRef.current.click()} disabled={busy} style={btnGhost}>Import</button>
+              <input ref={fileRef} type="file" accept="application/json,.json" style={{display:'none'}} onChange={(e)=>{ const f=e.target.files&&e.target.files[0]; if(f) onImport(f); e.target.value=''; }} />
+            </div>
+            <div style={{maxWidth:960, margin:'0 auto', padding:'0 16px 12px'}}>
+              <input value={query} onChange={(e)=>setQuery(e.target.value)} placeholder="Search title, description, location, or category…" style={inputStyle} />
+            </div>
+          </div>
+        );
+      }
+
+      function EmptyState({onCreate}){
+        return (
+          <div style={{marginTop:64, display:'flex', flexDirection:'column', alignItems:'center', gap:12, textAlign:'center'}}>
+            <div style={{height:80, width:80, borderRadius:16, border:'1px solid #2a2a2a', display:'grid', placeItems:'center'}}>📦</div>
+            <div>
+              <div style={{fontWeight:600, fontSize:18}}>No boxes yet</div>
+              <div style={{color:'#a3a3a3'}}>Tap New to add your first storage box.</div>
+            </div>
+            <button onClick={onCreate} style={btnPrimary}>New box</button>
+          </div>
+        );
+      }
+
+      function BoxCard({item,onEdit,onDelete}){
+        const cover = item.images && item.images[0] ? item.images[0].dataUrl : Placeholder();
+        return (
+          <div style={{border:'1px solid #262626', borderRadius:16, overflow:'hidden', background:'#141414'}}>
+            <div style={{aspectRatio:'16/9', background:'#1a1a1a', overflow:'hidden'}}>
+              <img src={cover} alt="cover" style={{width:'100%', height:'100%', objectFit:'cover'}} />
+            </div>
+            <div style={{padding:16}}>
+              <div style={{display:'flex', alignItems:'flex-start', gap:12}}>
+                <div style={{flex:1, minWidth:0}}>
+                  <div style={{fontWeight:600, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis'}}>{item.title||'(Untitled)'}</div>
+                  <div style={{fontSize:13, color:'#a3a3a3', whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis'}}>
+                    {item.category?`#${item.category}`:''}{item.category&&item.location?' · ':''}{item.location||''}
+                  </div>
+                </div>
+                <div style={{display:'flex', gap:8}}>
+                  <button onClick={onEdit} style={btnGhostSm}>Open</button>
+                  <button onClick={()=> confirm('Delete this box? This cannot be undone.') && onDelete()} style={btnDangerSm}>Delete</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      function EditorSheet({item,onClose,onSave}){
+        const [val,setVal] = React.useState(item);
+        const fileRef = React.useRef(null);
+        function setField(k,v){ setVal(prev=>({...prev,[k]:v})); }
+        async function onFiles(files){ if(!files||!files.length) return; const arr=[]; for(const f of Array.from(files)){ const dataUrl = await fileToDataUrl(f); arr.push({id:uid(), dataUrl, createdAt: Date.now()}); } setVal(prev=>({...prev, images:[...arr, ...(prev.images||[])]})); }
+        return (
+          <div style={{position:'fixed', inset:0, zIndex:30}}>
+            <div onClick={onClose} style={{position:'absolute', inset:0, background:'rgba(0,0,0,0.6)'}} />
+            <div style={{position:'absolute', right:0, top:0, bottom:0, width:'min(560px,100%)', background:'#0b0b0b', borderLeft:'1px solid #262626'}}>
+              <div style={{padding:12, display:'flex', alignItems:'center', gap:8, borderBottom:'1px solid #262626'}}>
+                <button onClick={onClose} style={btnGhostSm}>Close</button>
+                <div style={{flex:1, textAlign:'center', fontWeight:600}}>Edit Box</div>
+                <button onClick={()=>{ if(!val.title.trim() && !confirm('Title is empty. Save anyway?')) return; onSave(val); }} style={btnPrimarySm}>Save</button>
+              </div>
+              <div style={{padding:16, overflowY:'auto', height:'calc(100% - 48px)'}}>
+                <label style={{display:'block', marginBottom:12}}>
+                  <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>Title</div>
+                  <input value={val.title} onChange={(e)=>setField('title', e.target.value)} placeholder="e.g., Winter clothes" style={inputStyle} />
+                </label>
+                <label style={{display:'block', marginBottom:12}}>
+                  <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>Description</div>
+                  <textarea value={val.description} onChange={(e)=>setField('description', e.target.value)} placeholder="Optional notes about what’s inside" rows="3" style={textareaStyle}></textarea>
+                </label>
+                <div style={{display:'grid', gap:12, gridTemplateColumns:'1fr 1fr'}}>
+                  <label style={{display:'block'}}>
+                    <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>Location</div>
+                    <input value={val.location} onChange={(e)=>setField('location', e.target.value)} placeholder="e.g., Garage shelf A" style={inputStyle} />
+                  </label>
+                  <label style={{display:'block'}}>
+                    <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>Category</div>
+                    <input value={val.category} onChange={(e)=>setField('category', e.target.value)} placeholder="e.g., Clothing, Tools, Seasonal" style={inputStyle} />
+                  </label>
+                </div>
+                <div style={{marginTop:8}}>
+                  <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:8}}>Photos</div>
+                  <div style={{display:'flex', gap:8, marginBottom:8}}>
+                    <button onClick={()=> fileRef.current && fileRef.current.click()} style={btnGhost}>Add photos</button>
+                    <input ref={fileRef} type="file" accept="image/*" capture="environment" multiple style={{display:'none'}} onChange={(e)=> onFiles(e.target.files)} />
+                  </div>
+                  {(val.images||[]).length===0 ? (
+                    <div style={{fontSize:13, color:'#a3a3a3'}}>No photos yet.</div>
+                  ) : (
+                    <div style={{display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:8}}>
+                      {val.images.map(img=> (
+                        <div key={img.id} style={{position:'relative'}}>
+                          <img src={img.dataUrl} alt="box" style={{width:'100%', height:112, objectFit:'cover', borderRadius:8}} />
+                          <button onClick={()=> setVal(prev=>({...prev, images: prev.images.filter(x=>x.id!==img.id)}))} style={removeBadge}>×</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div style={{fontSize:12, color:'#8a8a8a', marginTop:12}}>
+                  Created {new Date(val.createdAt).toLocaleString()} · Updated {new Date(val.updatedAt).toLocaleString()}
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      function Root(){
+        React.useEffect(()=>{
+          if('serviceWorker' in navigator){ navigator.serviceWorker.register('./service-worker.js').catch(()=>{}); }
+        },[]);
+        return <App/>;
+      }
+
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(<Root/>);
+    </script>
+  </body>
+</html>
