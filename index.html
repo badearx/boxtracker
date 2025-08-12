@@ -3,22 +3,26 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <title>BoxTracker</title>
+    <title>BoxTracker v2</title>
     <meta name="theme-color" content="#0a0a0a" />
     <link rel="manifest" href="./manifest.webmanifest">
     <style>
       html,body,#root{height:100%;margin:0}
       body{background:#0a0a0a;color:#f5f5f5;font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial}
       button{cursor:pointer}
+      .touch-target{min-height:48px; min-width:48px}
+      .img-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:8px}
+      .img-grid img{width:100%; height:112px; object-fit:cover; border-radius:8px}
+      .lightbox{position:fixed; inset:0; background:rgba(0,0,0,.92); display:flex; align-items:center; justify-content:center; z-index:60}
+      .lightbox img{max-width:100vw; max-height:100vh; object-fit:contain}
     </style>
-    <!-- React + Babel (no build tools needed) -->
+    <!-- React + Babel -->
     <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   </head>
   <body>
     <div id="root"></div>
-
     <script type="text/babel">
       // ===== IndexedDB helpers =====
       const DB_NAME = 'boxtracker_db';
@@ -71,17 +75,16 @@
       const Placeholder = () => `data:image/svg+xml;utf8,${encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 800 450'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#1f1f1f'/><stop offset='100%' stop-color='#2a2a2a'/></linearGradient></defs><rect width='800' height='450' fill='url(#g)'/><text x='50%' y='50%' fill='#666' font-size='32' text-anchor='middle' dominant-baseline='middle' font-family='system-ui'>No photo</text></svg>")}`;
       const fileToDataUrl = (file)=> new Promise((res,rej)=>{ const rd=new FileReader(); rd.onload=()=>res(rd.result); rd.onerror=()=>rej(rd.error); rd.readAsDataURL(file); });
 
-      // ===== Styles (inline JS objects) =====
-      const btnPrimary = { padding:'10px 14px', borderRadius:12, background:'#6d28d9', color:'#fff', fontWeight:600, border:'1px solid #5b21b6' };
-      const btnGhost   = { padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a', fontWeight:500 };
-      const btnGhostSm = { ...btnGhost, padding:'8px 10px', fontSize:13 };
-      const btnPrimarySm = { ...btnPrimary, padding:'8px 10px', fontSize:13 };
+      // ===== Styles =====
+      const btnPrimary = { padding:'12px 16px', borderRadius:14, background:'#7c3aed', color:'#fff', fontWeight:700, border:'1px solid #6d28d9' };
+      const btnGhost   = { padding:'12px 16px', borderRadius:14, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a', fontWeight:600 };
+      const btnGhostSm = { ...btnGhost, padding:'9px 12px', fontSize:13 };
+      const btnPrimarySm = { ...btnPrimary, padding:'9px 12px', fontSize:13 };
       const btnDangerSm = { ...btnGhostSm, border:'1px solid #7f1d1d' };
-      const inputStyle = { width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', outline:'none', color:'#f5f5f5' };
+      const inputStyle = { width:'100%', borderRadius:14, background:'#111', border:'1px solid #262626', padding:'14px 16px', outline:'none', color:'#f5f5f5' };
       const textareaStyle = { ...inputStyle, minHeight:96, resize:'vertical' };
-      const removeBadge = { position:'absolute', top:6, right:6, background:'rgba(0,0,0,0.6)', border:'1px solid #2a2a2a', color:'#f5f5f5', borderRadius:8, padding:'2px 8px', fontSize:12 };
 
-      // ===== React App =====
+      // ===== App =====
       function App(){
         const [boxes,setBoxes] = React.useState([]);
         const [query,setQuery] = React.useState('');
@@ -117,12 +120,17 @@
             <div style={{maxWidth:960, margin:'0 auto', padding:16, paddingBottom:96}}>
               {filtered.length===0 ? <EmptyState onCreate={onCreate}/> : (
                 <div style={{display:'grid', gap:12}}>
-                  {filtered.map(b=> <BoxCard key={b.id} item={b} onEdit={()=>onEdit(b)} onDelete={()=>removeBox(b.id)} />)}
+                  {filtered.map(b=> <BoxCard key={b.id} item={b} onOpen={()=>onEdit(b)} onDelete={()=>removeBox(b.id)} />)}
                 </div>
               )}
             </div>
             {sheetOpen && editing && (
-              <EditorSheet item={editing} onClose={()=>{ setSheetOpen(false); setEditing(null); }} onSave={async(v)=>{ await saveBox(v); setSheetOpen(false); setEditing(null); }} />
+              <EditorSheet
+                item={editing}
+                onClose={()=>{ setSheetOpen(false); setEditing(null); }}
+                onSave={async(v)=>{ await saveBox(v); setSheetOpen(false); setEditing(null); }}
+                onDelete={async(id)=>{ if(confirm('Delete this box?')){ await removeBox(id); setSheetOpen(false); setEditing(null);} }}
+              />
             )}
           </div>
         );
@@ -135,9 +143,9 @@
             <div style={{maxWidth:960, margin:'0 auto', padding:'12px 16px', display:'flex', alignItems:'center', gap:12}}>
               <span style={{fontWeight:700}}>BoxTracker</span>
               <div style={{flex:1}} />
-              <button onClick={onCreate} style={btnPrimary}>New</button>
-              <button onClick={onExport} disabled={busy} style={btnGhost}>{busy?'Exporting…':'Export'}</button>
-              <button onClick={()=> fileRef.current && fileRef.current.click()} disabled={busy} style={btnGhost}>Import</button>
+              <button class="touch-target" onClick={onCreate} style={btnPrimary}>New</button>
+              <button class="touch-target" onClick={onExport} disabled={busy} style={btnGhost}>{busy?'Exporting…':'Export'}</button>
+              <button class="touch-target" onClick={()=> fileRef.current && fileRef.current.click()} disabled={busy} style={btnGhost}>Import</button>
               <input ref={fileRef} type="file" accept="application/json,.json" style={{display:'none'}} onChange={(e)=>{ const f=e.target.files&&e.target.files[0]; if(f) onImport(f); e.target.value=''; }} />
             </div>
             <div style={{maxWidth:960, margin:'0 auto', padding:'0 16px 12px'}}>
@@ -155,18 +163,20 @@
               <div style={{fontWeight:600, fontSize:18}}>No boxes yet</div>
               <div style={{color:'#a3a3a3'}}>Tap New to add your first storage box.</div>
             </div>
-            <button onClick={onCreate} style={btnPrimary}>New box</button>
+            <button class="touch-target" onClick={onCreate} style={btnPrimary}>New box</button>
           </div>
         );
       }
 
-      function BoxCard({item,onEdit,onDelete}){
+      function BoxCard({item,onOpen,onDelete}){
         const cover = item.images && item.images[0] ? item.images[0].dataUrl : Placeholder();
         return (
           <div style={{border:'1px solid #262626', borderRadius:16, overflow:'hidden', background:'#141414'}}>
-            <div style={{aspectRatio:'16/9', background:'#1a1a1a', overflow:'hidden'}}>
-              <img src={cover} alt="cover" style={{width:'100%', height:'100%', objectFit:'cover'}} />
-            </div>
+            <button onClick={onOpen} style={{padding:0, border:'none', background:'transparent', display:'block', width:'100%'}}>
+              <div style={{aspectRatio:'16/9', background:'#1a1a1a', overflow:'hidden'}}>
+                <img src={cover} alt="cover" style={{width:'100%', height:'100%', objectFit:'cover'}} />
+              </div>
+            </button>
             <div style={{padding:16}}>
               <div style={{display:'flex', alignItems:'flex-start', gap:12}}>
                 <div style={{flex:1, minWidth:0}}>
@@ -176,8 +186,8 @@
                   </div>
                 </div>
                 <div style={{display:'flex', gap:8}}>
-                  <button onClick={onEdit} style={btnGhostSm}>Open</button>
-                  <button onClick={()=> confirm('Delete this box? This cannot be undone.') && onDelete()} style={btnDangerSm}>Delete</button>
+                  <button class="touch-target" onClick={onOpen} style={btnGhostSm}>Open</button>
+                  <button class="touch-target" onClick={()=> confirm('Delete this box? This cannot be undone.') && onDelete()} style={btnDangerSm}>Delete</button>
                 </div>
               </div>
             </div>
@@ -185,21 +195,26 @@
         );
       }
 
-      function EditorSheet({item,onClose,onSave}){
+      function EditorSheet({item,onClose,onSave,onDelete}){
         const [val,setVal] = React.useState(item);
-        const fileRef = React.useRef(null);
+        const [lightbox,setLightbox] = React.useState(null); // {src, idx}
+        const camRef = React.useRef(null);
+        const galRef = React.useRef(null);
+
         function setField(k,v){ setVal(prev=>({...prev,[k]:v})); }
         async function onFiles(files){ if(!files||!files.length) return; const arr=[]; for(const f of Array.from(files)){ const dataUrl = await fileToDataUrl(f); arr.push({id:uid(), dataUrl, createdAt: Date.now()}); } setVal(prev=>({...prev, images:[...arr, ...(prev.images||[])]})); }
+
         return (
           <div style={{position:'fixed', inset:0, zIndex:30}}>
             <div onClick={onClose} style={{position:'absolute', inset:0, background:'rgba(0,0,0,0.6)'}} />
             <div style={{position:'absolute', right:0, top:0, bottom:0, width:'min(560px,100%)', background:'#0b0b0b', borderLeft:'1px solid #262626'}}>
               <div style={{padding:12, display:'flex', alignItems:'center', gap:8, borderBottom:'1px solid #262626'}}>
-                <button onClick={onClose} style={btnGhostSm}>Close</button>
+                <button class="touch-target" onClick={onClose} style={btnGhostSm}>Close</button>
                 <div style={{flex:1, textAlign:'center', fontWeight:600}}>Edit Box</div>
-                <button onClick={()=>{ if(!val.title.trim() && !confirm('Title is empty. Save anyway?')) return; onSave(val); }} style={btnPrimarySm}>Save</button>
+                <button class="touch-target" onClick={()=>{ if(!val.title.trim() && !confirm('Title is empty. Save anyway?')) return; onSave(val); }} style={btnPrimarySm}>Save</button>
               </div>
-              <div style={{padding:16, overflowY:'auto', height:'calc(100% - 48px)'}}>
+
+              <div style={{padding:16, overflowY:'auto', height:'calc(100% - 56px)'}}>
                 <label style={{display:'block', marginBottom:12}}>
                   <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>Title</div>
                   <input value={val.title} onChange={(e)=>setField('title', e.target.value)} placeholder="e.g., Winter clothes" style={inputStyle} />
@@ -218,38 +233,54 @@
                     <input value={val.category} onChange={(e)=>setField('category', e.target.value)} placeholder="e.g., Clothing, Tools, Seasonal" style={inputStyle} />
                   </label>
                 </div>
+
                 <div style={{marginTop:8}}>
-                  <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:8}}>Photos</div>
-                  <div style={{display:'flex', gap:8, marginBottom:8}}>
-                    <button onClick={()=> fileRef.current && fileRef.current.click()} style={btnGhost}>Add photos</button>
-                    <input ref={fileRef} type="file" accept="image/*" capture="environment" multiple style={{display:'none'}} onChange={(e)=> onFiles(e.target.files)} />
+                  <div style={{fontSize:13, fontWeight:700, color:'#e5e5e5', marginBottom:8}}>Photos</div>
+                  <!-- Bigger, easier capture buttons -->
+                  <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12}}>
+                    <button class="touch-target" onClick={()=> camRef.current && camRef.current.click()} style={btnPrimary}>📷 Take photo</button>
+                    <button class="touch-target" onClick={()=> galRef.current && galRef.current.click()} style={btnGhost}>🖼️ From gallery</button>
+                    <input ref={camRef} type="file" accept="image/*" capture="environment" multiple style="display:none" onChange={(e)=> onFiles(e.target.files)} />
+                    <input ref={galRef} type="file" accept="image/*" multiple style="display:none" onChange={(e)=> onFiles(e.target.files)} />
                   </div>
+
                   {(val.images||[]).length===0 ? (
                     <div style={{fontSize:13, color:'#a3a3a3'}}>No photos yet.</div>
                   ) : (
-                    <div style={{display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:8}}>
-                      {val.images.map(img=> (
+                    <div class="img-grid">
+                      {val.images.map((img, idx)=> (
                         <div key={img.id} style={{position:'relative'}}>
-                          <img src={img.dataUrl} alt="box" style={{width:'100%', height:112, objectFit:'cover', borderRadius:8}} />
-                          <button onClick={()=> setVal(prev=>({...prev, images: prev.images.filter(x=>x.id!==img.id)}))} style={removeBadge}>×</button>
+                          <button onClick={()=> setLightbox({src: img.dataUrl, idx})} style={{padding:0, border:'none', background:'transparent', display:'block', width:'100%'}}>
+                            <img src={img.dataUrl} alt="box" />
+                          </button>
+                          <button class="touch-target" onClick={()=> setVal(prev=>({...prev, images: prev.images.filter(x=>x.id!==img.id)}))} style={{position:'absolute', top:6, right:6, background:'rgba(0,0,0,0.6)', border:'1px solid #2a2a2a', color:'#f5f5f5', borderRadius:8, padding:'2px 8px', fontSize:12}}>×</button>
                         </div>
                       ))}
                     </div>
                   )}
                 </div>
+
+                <div style={{display:'flex', gap:12, marginTop:16}}>
+                  <button class="touch-target" onClick={()=>{ if(confirm('Delete this box?')) onDelete(val.id); }} style={btnDangerSm}>Delete box</button>
+                </div>
+
                 <div style={{fontSize:12, color:'#8a8a8a', marginTop:12}}>
                   Created {new Date(val.createdAt).toLocaleString()} · Updated {new Date(val.updatedAt).toLocaleString()}
                 </div>
               </div>
+
+              {lightbox && (
+                <div class="lightbox" onClick={()=> setLightbox(null)}>
+                  <img src={lightbox.src} alt="full" />
+                </div>
+              )}
             </div>
           </div>
         );
       }
 
       function Root(){
-        React.useEffect(()=>{
-          if('serviceWorker' in navigator){ navigator.serviceWorker.register('./service-worker.js').catch(()=>{}); }
-        },[]);
+        React.useEffect(()=>{ if('serviceWorker' in navigator){ navigator.serviceWorker.register('./service-worker.js').catch(()=>{}); } },[]);
         return <App/>;
       }
 
