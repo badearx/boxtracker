@@ -17,12 +17,13 @@
       .lightbox{position:fixed; inset:0; background:rgba(0,0,0,.92); display:flex; align-items:center; justify-content:center; z-index:60}
       .lightbox img{max-width:100vw; max-height:100vh; object-fit:contain}
       .sheet{position:fixed; inset:0; z-index:30}
-      .sheet-back{position:absolute; inset:0; background:rgba(0,0,0,.6)}
+      .sheet-back{position:absolute; inset:0; background:rgba(0,0,0,0.6)}
       .sheet-card{position:absolute; right:0; top:0; bottom:0; width:min(560px,100%); background:#0b0b0b; border-left:1px solid #262626}
-      .error{font-size:12px; color:#fca5a5; padding:6px 10px; border:1px solid #7f1d1d; background:#1b1212; border-radius:10px}
-      .hint{font-size:12px; color:#a3a3a3}
+      /* Error overlay */
+      #err{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);color:#fff;z-index:9999;padding:16px;overflow:auto}
+      #err pre{white-space:pre-wrap}
     </style>
-    <!-- React + Babel + MSAL -->
+    <!-- React + Babel + MSAL (CDNs are cached by service worker below) -->
     <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
@@ -30,23 +31,40 @@
   </head>
   <body>
     <div id="root"></div>
+    <div id="err"><h2>Something went wrong</h2><pre id="errm"></pre></div>
+
+    <script>
+      // Minimal error overlay so we never get a silent black screen
+      window.addEventListener('error', e=>{ const box=document.getElementById('err'); const m=document.getElementById('errm'); m.textContent=(e.error&&e.error.stack)||e.message||String(e); box.style.display='block'; });
+      window.addEventListener('unhandledrejection', e=>{ const box=document.getElementById('err'); const m=document.getElementById('errm'); m.textContent=(e.reason&&e.reason.stack)||e.reason||'Unhandled promise rejection'; box.style.display='block'; });
+      // Register SW
+      if('serviceWorker' in navigator){ navigator.serviceWorker.register('./service-worker.js').catch(()=>{}); }
+    </script>
 
     <script type="text/babel">
-      // ===== IndexedDB =====
+      // =========================
+      //  IndexedDB helpers
+      // =========================
       const DB_NAME='boxtracker_db'; const DB_VERSION=1; const STORE='boxes';
       function openDB(){ return new Promise((res,rej)=>{ const req=indexedDB.open(DB_NAME,DB_VERSION); req.onupgradeneeded=()=>{ const db=req.result; if(!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE,{keyPath:'id'}); }; req.onsuccess=()=>res(req.result); req.onerror=()=>rej(req.error); }); }
       async function dbGetAll(){ const db=await openDB(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readonly'); const s=tx.objectStore(STORE); const r=s.getAll(); r.onsuccess=()=>res(r.result||[]); r.onerror=()=>rej(r.error); }); }
       async function dbPut(item){ const db=await openDB(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readwrite'); const s=tx.objectStore(STORE); const r=s.put(item); r.onsuccess=()=>res(true); r.onerror=()=>rej(r.error); }); }
+      async function dbDelete(id){ const db=await openDB(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readwrite'); const s=tx.objectStore(STORE); const r=s.delete(id); r.onsuccess=()=>res(true); r.onerror=()=>rej(r.error); }); }
       async function dbSoftDelete(id){ const all=await dbGetAll(); const t=all.find(x=>x.id===id); if(!t) return; const now=Date.now(); const tomb={...t, deletedAt:now, updatedAt:now}; await dbPut(tomb); }
+
+      // =========================
+      //  Utilities
+      // =========================
       const uid=()=>Math.random().toString(36).slice(2)+Date.now().toString(36);
       const Placeholder=()=>`data:image/svg+xml;utf8,${encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 800 450'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#1f1f1f'/><stop offset='100%' stop-color='#2a2a2a'/></linearGradient></defs><rect width='800' height='450' fill='url(#g)'/><text x='50%' y='50%' fill='#666' font-size='32' text-anchor='middle' dominant-baseline='middle' font-family='system-ui'>No photo</text></svg>")}`;
       function ts(r){ return Math.max(r.updatedAt||0, r.deletedAt||0); }
       async function compressToJpegDataUrl(file, maxDim=1600, quality=0.8){ const url=URL.createObjectURL(file); try{ const img=await new Promise((ok,err)=>{ const im=new Image(); im.onload=()=>ok(im); im.onerror=err; im.src=url; }); const scale=Math.min(1, maxDim/Math.max(img.width,img.height)); const w=Math.round(img.width*scale), h=Math.round(img.height*scale); const c=document.createElement('canvas'); c.width=w; c.height=h; c.getContext('2d').drawImage(img,0,0,w,h); return c.toDataURL('image/jpeg',quality); } finally{ URL.revokeObjectURL(url); } }
 
-      // ===== MSAL (OneDrive default; SharePoint optional) =====
+      // =========================
+      //  Microsoft Graph (OneDrive)
+      // =========================
       const GRAPH='https://graph.microsoft.com/v1.0';
-      // We request User.Read so we can show your real name; Sites.ReadWrite.All so SharePoint works too
-      const SCOPES=['Files.ReadWrite','Sites.ReadWrite.All','User.Read','openid','profile','offline_access'];
+      const SCOPES=['User.Read','Files.ReadWrite','openid','profile','offline_access'];
       const MSAL_CONFIG={ auth:{ clientId:'de0b7ce9-ac79-4043-a534-041e72cab5a2', authority:'https://login.microsoftonline.com/b4ccf74c-7f14-496f-8948-ebac34f6cf1e', redirectUri: window.location.origin + window.location.pathname }, cache:{ cacheLocation:'localStorage' } };
 
       function useMSAL(){
@@ -56,18 +74,20 @@
         const [authError,setAuthError]=React.useState(null);
 
         React.useEffect(()=>{
-          instance.handleRedirectPromise().then(async (result)=>{
-            if(result && result.account){ instance.setActiveAccount(result.account); setAccount(result.account); }
-            const accs=instance.getAllAccounts();
-            if(!result && accs.length){ instance.setActiveAccount(accs[0]); setAccount(accs[0]); }
-            if(instance.getActiveAccount()){
-              try{ const tok=await token(); const me=await fetch(`${GRAPH}/me`,{headers:{Authorization:`Bearer ${tok}`}}).then(r=>r.json()); setProfile(me); setAuthError(null); }
-              catch(e){ setAuthError(e && (e.message||String(e))); }
-            }
-          }).catch(e=> setAuthError(e && (e.message||String(e))));
+          instance.handleRedirectPromise()
+            .then(async (result)=>{
+              if(result && result.account){ instance.setActiveAccount(result.account); setAccount(result.account); }
+              const accs=instance.getAllAccounts();
+              if(!result && accs.length){ instance.setActiveAccount(accs[0]); setAccount(accs[0]); }
+              if(instance.getActiveAccount()){
+                try{ const tok=await token(); const me=await fetch(`${GRAPH}/me`,{headers:{Authorization:`Bearer ${tok}`}}).then(r=>r.json()); setProfile(me); setAuthError(null); }
+                catch(e){ setAuthError(e && (e.message||String(e))); }
+              }
+            })
+            .catch(e=> setAuthError(e && (e.message||String(e))));
         },[instance]);
 
-        async function signIn(){ setAuthError(null); try{ await instance.loginRedirect({scopes:SCOPES}); }catch(e){ setAuthError(e && (e.message||String(e))); } }
+        async function signIn(){ setAuthError(null); try{ await instance.loginRedirect({scopes:SCOPES}); }catch(e){ setAuthError(e && (e.message||String(e))); }}
         async function signOut(){ const acc=instance.getActiveAccount(); if(acc){ await instance.logoutRedirect({account:acc}); } setAccount(null); setProfile(null); }
         async function token(){ const acc=instance.getActiveAccount(); if(!acc) throw new Error('Not signed in'); try{ const r=await instance.acquireTokenSilent({scopes:SCOPES, account:acc}); return r.accessToken; }catch{ await instance.acquireTokenRedirect({scopes:SCOPES}); throw new Error('Redirecting for token'); } }
 
@@ -79,37 +99,34 @@
       async function uploadJSONOD(tok, text){ await ensureFolderOD(tok); const url=`${GRAPH}/me/drive/root:/BoxTracker/boxes.json:/content`; const r=await fetch(url,{method:'PUT', headers:{Authorization:`Bearer ${tok}`, 'Content-Type':'application/json'}, body:text}); if(!r.ok) throw new Error('Upload failed: '+r.status); }
       async function downloadJSONOD(tok){ const url=`${GRAPH}/me/drive/root:/BoxTracker/boxes.json:/content`; const r=await fetch(url,{headers:{Authorization:`Bearer ${tok}`}}); if(r.status===404) return null; if(!r.ok) throw new Error('Download failed: '+r.status); return await r.json(); }
 
-      async function getSiteAndDrive(tok, siteUrl){ const u=new URL(siteUrl); const site=await fetch(`${GRAPH}/sites/${u.hostname}:${u.pathname}`,{headers:{Authorization:`Bearer ${tok}`}}).then(r=>r.json()); const drv=await fetch(`${GRAPH}/sites/${site.id}/drive`,{headers:{Authorization:`Bearer ${tok}`}}).then(r=>r.json()); return { siteId: site.id, driveId: drv.id }; }
-      async function uploadJSONSP(tok, siteUrl, text){ const {siteId,driveId}=await getSiteAndDrive(tok, siteUrl); const url=`${GRAPH}/sites/${siteId}/drives/${driveId}/root:/BoxTracker/boxes.json:/content`; const r=await fetch(url,{method:'PUT', headers:{Authorization:`Bearer ${tok}`, 'Content-Type':'application/json'}, body:text}); if(!r.ok) throw new Error('SP upload failed: '+r.status); }
-      async function downloadJSONSP(tok, siteUrl){ const {siteId,driveId}=await getSiteAndDrive(tok, siteUrl); const url=`${GRAPH}/sites/${siteId}/drives/${driveId}/root:/BoxTracker/boxes.json:/content`; const r=await fetch(url,{headers:{Authorization:`Bearer ${tok}`}}); if(r.status===404) return null; if(!r.ok) throw new Error('SP download failed: '+r.status); return await r.json(); }
-
-      // ===== App =====
+      // =========================
+      //  App
+      // =========================
       function App(){
-        const {who, signIn, signOut, token, authError, account} = useMSAL();
-        const [boxes,setBoxes]=React.useState([]); const [q,setQ]=React.useState('');
-        const [sheetOpen,setSheetOpen]=React.useState(false); const [editing,setEditing]=React.useState(null);
-        const [busy,setBusy]=React.useState(false); const [target,setTarget]=React.useState(()=> localStorage.getItem('bt_target')||'onedrive');
-        const [spUrl,setSpUrl]=React.useState(()=> localStorage.getItem('bt_spUrl')||'https://squaredqubit.sharepoint.com/sites/BoxTracker');
-        const [syncError,setSyncError]=React.useState(null);
+        const { who, signIn, signOut, token, authError, account } = useMSAL();
+        const [boxes,setBoxes]=React.useState([]);
+        const [q,setQ]=React.useState('');
+        const [sheetOpen,setSheetOpen]=React.useState(false);
+        const [editing,setEditing]=React.useState(null);
+        const [busy,setBusy]=React.useState(false);
+        const [autoSync,setAutoSync]=React.useState(()=> localStorage.getItem('bt_autoSync')==='1');
 
-        React.useEffect(()=>{ (async()=>{ const all=await dbGetAll(); all.sort((a,b)=>ts(b)-ts(a)); setBoxes(all); })(); },[]);
-        React.useEffect(()=>{ localStorage.setItem('bt_target', target); },[target]);
-        React.useEffect(()=>{ localStorage.setItem('bt_spUrl', spUrl); },[spUrl]);
+        React.useEffect(()=>{ (async()=>{ const all=await dbGetAll(); all.sort((a,b)=>Math.max(b.updatedAt||0,b.deletedAt||0)-Math.max(a.updatedAt||0,a.deletedAt||0)); setBoxes(all); })(); },[]);
+        React.useEffect(()=>{ localStorage.setItem('bt_autoSync', autoSync?'1':'0'); },[autoSync]);
 
         function visible(list){ return list.filter(b=>!b.deletedAt); }
-        async function saveBox(item){ const now=Date.now(); const payload={...item, updatedAt:now, id:item.id||uid(), createdAt:item.createdAt||now}; await dbPut(payload); setBoxes(prev=>{ const ex=prev.some(x=>x.id===payload.id); const next=ex?prev.map(x=>x.id===payload.id?payload:x):[payload,...prev]; next.sort((a,b)=>ts(b)-ts(a)); return next; }); }
-        async function removeBox(id){ await dbSoftDelete(id); const all=await dbGetAll(); all.sort((a,b)=>ts(b)-ts(a)); setBoxes(all); }
+        async function saveBox(item){ const now=Date.now(); const payload={...item, updatedAt:now, id:item.id||uid(), createdAt:item.createdAt||now}; await dbPut(payload); setBoxes(prev=>{ const ex=prev.some(x=>x.id===payload.id); const next=ex?prev.map(x=>x.id===payload.id?payload:x):[payload,...prev]; next.sort((a,b)=>Math.max(b.updatedAt||0,b.deletedAt||0)-Math.max(a.updatedAt||0,a.deletedAt||0)); return next; }); if(account&&autoSync){ try{ await syncNow('merge'); }catch(e){ console.warn('auto-sync failed',e);} } }
+        async function removeBox(id){ await dbSoftDelete(id); const all=await dbGetAll(); all.sort((a,b)=>Math.max(b.updatedAt||0,b.deletedAt||0)-Math.max(a.updatedAt||0,a.deletedAt||0)); setBoxes(all); if(account&&autoSync){ try{ await syncNow('merge'); }catch(e){ console.warn('auto-sync failed',e);} } }
 
         const filtered=React.useMemo(()=>{ const list=visible(boxes); if(!q.trim()) return list; const qq=q.toLowerCase(); return list.filter(b=>[b.title,b.description,b.location,b.category].filter(Boolean).some(t=>String(t).toLowerCase().includes(qq))); },[boxes,q]);
         function onCreate(){ setEditing({id:uid(), title:'', description:'', location:'', category:'', images:[], createdAt:Date.now(), updatedAt:Date.now()}); setSheetOpen(true); }
         function onEdit(b){ setEditing(JSON.parse(JSON.stringify(b))); setSheetOpen(true); }
 
         function exportJSON(){ const blob=new Blob([JSON.stringify(boxes,null,2)],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=`BoxTracker_Backup_${new Date().toISOString().slice(0,10)}.json`; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); }
+        async function importJSON(file){ try{ setBusy(true); const text=await file.text(); const imported=JSON.parse(text); if(!Array.isArray(imported)) throw new Error('Invalid backup format'); for(const box of imported) await dbPut(box); const all=await dbGetAll(); all.sort((a,b)=>Math.max(b.updatedAt||0,b.deletedAt||0)-Math.max(a.updatedAt||0,a.deletedAt||0)); setBoxes(all); alert('Import complete'); } catch(e){ alert('Import failed: '+(e&&e.message?e.message:e)); } finally{ setBusy(false); } }
 
-        async function syncNow(){ setSyncError(null); if(!account){ alert('Please sign in first.'); return; } setBusy(true); try{ const at=await token(); let remote=null; if(target==='onedrive') remote=await downloadJSONOD(at); else remote=await downloadJSONSP(at, spUrl); const local=boxes; let merged=[]; if(!remote){ merged=local; } else { const map=new Map(); for(const r of remote) map.set(r.id,r); for(const l of local){ const r=map.get(l.id); if(!r){ map.set(l.id,l); continue; } map.set(l.id, ts(l)>=ts(r)?l:r); } merged=Array.from(map.values()); }
-            for(const m of merged) await dbPut(m); const all=await dbGetAll(); all.sort((a,b)=>ts(b)-ts(a)); setBoxes(all); const text=JSON.stringify(merged,null,2); if(target==='onedrive') await uploadJSONOD(at,text); else await uploadJSONSP(at, spUrl, text); alert('Sync complete'); }
-          catch(e){ const msg = (e && (e.message||String(e))) || 'Unknown error'; setSyncError(msg); console.error('Sync error', e); alert('Sync failed: '+msg); }
-          finally{ setBusy(false); } }
+        async function syncNow(strategy='merge'){ if(!account) throw new Error('Sign in first'); setBusy(true); try{ const at=await token(); const remote=await downloadJSONOD(at); const local=boxes; let merged=[]; if(!remote||strategy==='pushLocal'){ merged=local; } else { const map=new Map(); for(const r of remote) map.set(r.id,r); for(const l of local){ const r=map.get(l.id); if(!r){ map.set(l.id,l); continue; } const lts=Math.max(l.updatedAt||0,l.deletedAt||0); const rts=Math.max(r.updatedAt||0,r.deletedAt||0); map.set(l.id, lts>=rts?l:r); } merged=Array.from(map.values()); }
+          for(const m of merged) await dbPut(m); const all=await dbGetAll(); all.sort((a,b)=>Math.max(b.updatedAt||0,b.deletedAt||0)-Math.max(a.updatedAt||0,a.deletedAt||0)); setBoxes(all); await uploadJSONOD(at, JSON.stringify(merged,null,2)); alert('Sync complete'); } finally{ setBusy(false); } }
 
         return (
           <div style={{minHeight:'100vh'}}>
@@ -117,28 +134,23 @@
               <div style={{maxWidth:960, margin:'0 auto', padding:'12px 16px', display:'flex', alignItems:'center', gap:12, flexWrap:'wrap'}}>
                 <span style={{fontWeight:700}}>BoxTracker</span>
                 <div style={{flex:1}}></div>
-                {who && <span class="pill">Signed in as: {who}</span>}
-                {!who && <button class="touch" onClick={signIn} style={{padding:'8px 10px', borderRadius:12, background:'#111', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>Sign in</button>}
-                {who && <>
-                  <select value={target} onChange={(e)=>setTarget(e.target.value)} style={{padding:'8px 10px', borderRadius:12, background:'#111', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>
-                    <option value="onedrive">OneDrive</option>
-                    <option value="sharepoint">SharePoint</option>
-                  </select>
-                  {target==='sharepoint' && <input value={spUrl} onChange={(e)=>setSpUrl(e.target.value)} placeholder="https://.../sites/YourSite" style={{padding:'8px 10px', borderRadius:12, background:'#111', color:'#e5e5e5', border:'1px solid #2a2a2a', minWidth:260}} />}
-                  <button class="touch" onClick={syncNow} disabled={busy} style={{padding:'10px 14px', borderRadius:12, background:'#0f172a', color:'#e5e5e5', border:'1px solid #1f2937'}}>{busy?'Syncing…':'Sync now'}</button>
-                  <button class="touch" onClick={signOut} style={{padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>Sign out</button>
-                </>}
-                <button class="touch" onClick={onCreate} style={{padding:'10px 14px', borderRadius:12, background:'#6d28d9', color:'#fff', fontWeight:700, border:'1px solid #5b21b6'}}>New</button>
-                <button class="touch" onClick={exportJSON} style={{padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>Export</button>
-                <label class="touch" style={{padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>
+                {who && <span className="pill">Signed in as: {who}</span>}
+                {!who && <button className="touch" onClick={signIn} style={{padding:'8px 10px', borderRadius:12, background:'#111', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>Sign in</button>}
+                {who && <button className="touch" onClick={()=>syncNow('merge')} style={{padding:'10px 14px', borderRadius:12, background:'#0f172a', color:'#e5e5e5', border:'1px solid #1f2937'}}>Sync now</button>}
+                {who && <button className="touch" onClick={signOut} style={{padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>Sign out</button>}
+                <label className="touch" style={{padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a', display:'flex', alignItems:'center', gap:8}}>
+                  <input type="checkbox" checked={autoSync} onChange={(e)=> setAutoSync(e.target.checked)} /> Auto‑sync
+                </label>
+                <button className="touch" onClick={onCreate} style={{padding:'10px 14px', borderRadius:12, background:'#6d28d9', color:'#fff', fontWeight:700, border:'1px solid #5b21b6'}}>New</button>
+                <button className="touch" onClick={exportJSON} disabled={busy} style={{padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>{busy?'Exporting…':'Export'}</button>
+                <label className="touch" style={{padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>
                   Import
-                  <input type="file" accept="application/json,.json" style={{display:'none'}} onChange={(e)=>{ const f=e.target.files&&e.target.files[0]; if(f){ f.text().then(t=>{ try{ const j=JSON.parse(t); j.forEach(dbPut); alert('Import queued'); }catch(err){ alert('Invalid JSON'); } }); } e.target.value=''; }} />
+                  <input type="file" accept="application/json,.json" style={{display:'none'}} onChange={(e)=>{ const f=e.target.files&&e.target.files[0]; if(f) importJSON(f); e.target.value=''; }} />
                 </label>
               </div>
               <div style={{maxWidth:960, margin:'0 auto', padding:'0 16px 12px'}}>
                 <input value={q} onChange={(e)=>setQ(e.target.value)} placeholder="Search title, description, location, or category…" style={{width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', outline:'none', color:'#f5f5f5'}} />
-                {authError && <div class="error" style="margin-top:8px">Auth error: {authError}</div>}
-                {(!authError && !who) && <div class="hint" style="margin-top:6px">Tip: if sign-in loops, double-check the SPA Redirect URI in Entra matches this URL exactly.</div>}
+                {authError && <div style={{marginTop:8, fontSize:12, color:'#fca5a5', padding:'6px 10px', border:'1px solid #7f1d1d', background:'#1b1212', borderRadius:10}}>Auth error: {authError}</div>}
               </div>
             </div>
 
@@ -158,6 +170,7 @@
               <div style={{marginTop:64, display:'flex', flexDirection:'column', alignItems:'center', gap:12, textAlign:'center'}}>
                 <div style={{height:80, width:80, borderRadius:16, border:'1px solid #2a2a2a', display:'grid', placeItems:'center'}}>📦</div>
                 <div><div style={{fontWeight:600, fontSize:18}}>No boxes yet</div><div style={{color:'#a3a3a3'}}>Tap New to add your first storage box.</div></div>
+                <button className="touch" onClick={()=>onOpen({id:null})} style={{padding:'10px 14px', borderRadius:12, background:'#6d28d9', color:'#fff', fontWeight:700, border:'1px solid #5b21b6'}}>New box</button>
               </div>
             ) : (
               <div style={{display:'grid', gap:12}}>
@@ -184,8 +197,8 @@
                   <div style={{fontSize:13, color:'#a3a3a3', whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis'}}>{item.category?`#${item.category}`:''}{item.category&&item.location?' · ':''}{item.location||''}</div>
                 </div>
                 <div style={{display:'flex', gap:8}}>
-                  <button class="touch" onClick={onOpen} style={{padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>Open</button>
-                  <button class="touch" onClick={()=> confirm('Delete this box? This cannot be undone.') && onDelete()} style={{padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #7f1d1d'}}>Delete</button>
+                  <button className="touch" onClick={onOpen} style={{padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>Open</button>
+                  <button className="touch" onClick={()=> confirm('Delete this box? This cannot be undone.') && onDelete()} style={{padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #7f1d1d'}}>Delete</button>
                 </div>
               </div>
             </div>
@@ -194,18 +207,21 @@
       }
 
       function EditorSheet({item,onClose,onSave}){
-        const [val,setVal]=React.useState(item); const [lightbox,setLightbox]=React.useState(null); const camRef=React.useRef(null); const galRef=React.useRef(null);
+        const [val,setVal]=React.useState(item && item.id ? item : {id:uid(), title:'', description:'', location:'', category:'', images:[], createdAt:Date.now(), updatedAt:Date.now()});
+        const [lightbox,setLightbox]=React.useState(null);
+        const camRef=React.useRef(null); const galRef=React.useRef(null);
         function setField(k,v){ setVal(p=>({...p,[k]:v})); }
         async function onFiles(files){ if(!files||!files.length) return; const arr=[]; for(const f of Array.from(files)){ const dataUrl=await compressToJpegDataUrl(f,1600,0.8); arr.push({id:uid(), dataUrl, createdAt:Date.now()}); } setVal(p=>({...p, images:[...arr, ...(p.images||[])]})); }
         return (
-          <div class="sheet">
-            <div class="sheet-back" onClick={onClose}></div>
-            <div class="sheet-card">
+          <div className="sheet">
+            <div className="sheet-back" onClick={onClose}></div>
+            <div className="sheet-card">
               <div style={{padding:12, display:'flex', alignItems:'center', gap:8, borderBottom:'1px solid #262626'}}>
-                <button class="touch" onClick={onClose} style={{padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>Close</button>
+                <button className="touch" onClick={onClose} style={{padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a'}}>Close</button>
                 <div style={{flex:1, textAlign:'center', fontWeight:600}}>Edit Box</div>
-                <button class="touch" onClick={()=>{ if(!val.title.trim() && !confirm('Title is empty. Save anyway?')) return; onSave(val); }} style={{padding:'8px 10px', borderRadius:12, background:'#6d28d9', color:'#fff', fontWeight:700, border:'1px solid #5b21b6'}}>Save</button>
+                <button className="touch" onClick={()=>{ if(!val.title.trim() && !confirm('Title is empty. Save anyway?')) return; onSave(val); }} style={{padding:'8px 10px', borderRadius:12, background:'#6d28d9', color:'#fff', fontWeight:700, border:'1px solid #5b21b6'}}>Save</button>
               </div>
+
               <div style={{padding:16, overflowY:'auto', height:'calc(100% - 56px)'}}>
                 <label style={{display:'block', marginBottom:12}}>
                   <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>Title</div>
@@ -228,19 +244,19 @@
                 <div style={{marginTop:8}}>
                   <div style={{fontSize:13, fontWeight:700, color:'#e5e5e5', marginBottom:8}}>Photos</div>
                   <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12}}>
-                    <button class="touch" onClick={()=>camRef.current&&camRef.current.click()} style={{padding:'12px 16px', borderRadius:14, background:'#7c3aed', color:'#fff', fontWeight:700, border:'1px solid #6d28d9'}}>📷 Take photo</button>
-                    <button class="touch" onClick={()=>galRef.current&&galRef.current.click()} style={{padding:'12px 16px', borderRadius:14, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a', fontWeight:600}}>🖼️ From gallery</button>
+                    <button className="touch" onClick={()=>camRef.current&&camRef.current.click()} style={{padding:'12px 16px', borderRadius:14, background:'#7c3aed', color:'#fff', fontWeight:700, border:'1px solid #6d28d9'}}>📷 Take photo</button>
+                    <button className="touch" onClick={()=>galRef.current&&galRef.current.click()} style={{padding:'12px 16px', borderRadius:14, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a', fontWeight:600}}>🖼️ From gallery</button>
                     <input ref={camRef} type="file" accept="image/*" capture="environment" multiple style={{display:'none'}} onChange={(e)=>onFiles(e.target.files)} />
                     <input ref={galRef} type="file" accept="image/*" multiple style={{display:'none'}} onChange={(e)=>onFiles(e.target.files)} />
                   </div>
                   {(val.images||[]).length===0 ? <div style={{fontSize:13,color:'#a3a3a3'}}>No photos yet.</div> : (
-                    <div class="img-grid">
+                    <div className="img-grid">
                       {val.images.map(img=> (
                         <div key={img.id} style={{position:'relative'}}>
                           <button onClick={()=>setLightbox({src:img.dataUrl})} style={{padding:0, border:'none', background:'transparent', display:'block', width:'100%'}}>
                             <img src={img.dataUrl} alt="box" />
                           </button>
-                          <button class="touch" onClick={()=>{ if(confirm('Remove this photo?')) setVal(p=>({...p, images:p.images.filter(x=>x.id!==img.id)})); }} style={{position:'absolute', top:6, right:6, background:'rgba(0,0,0,0.6)', border:'1px solid #2a2a2a', color:'#f5f5f5', borderRadius:8, padding:'2px 8px', fontSize:12}}>×</button>
+                          <button className="touch" onClick={()=>{ if(confirm('Remove this photo?')) setVal(p=>({...p, images:p.images.filter(x=>x.id!==img.id)})); }} style={{position:'absolute', top:6, right:6, background:'rgba(0,0,0,0.6)', border:'1px solid #2a2a2a', color:'#f5f5f5', borderRadius:8, padding:'2px 8px', fontSize:12}}>×</button>
                         </div>
                       ))}
                     </div>
@@ -248,13 +264,13 @@
                 </div>
                 <div style={{fontSize:12, color:'#8a8a8a', marginTop:12}}>Created {new Date(val.createdAt).toLocaleString()} · Updated {new Date(val.updatedAt).toLocaleString()}</div>
               </div>
-              {lightbox && <div class="lightbox" onClick={()=>setLightbox(null)}><img src={lightbox.src} alt="full" /></div>}
+              {lightbox && <div className="lightbox" onClick={()=>setLightbox(null)}><img src={lightbox.src} alt="full" /></div>}
             </div>
           </div>
         );
       }
 
-      function Root(){ React.useEffect(()=>{ if('serviceWorker' in navigator){ navigator.serviceWorker.register('./service-worker.js').catch(()=>{}); } },[]); return <App/>; }
+      function Root(){ return <App/>; }
       const root = ReactDOM.createRoot(document.getElementById('root')); root.render(<Root/>);
     </script>
   </body>

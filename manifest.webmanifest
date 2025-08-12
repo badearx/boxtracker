@@ -1,15 +1,12 @@
 {
   "name": "BoxTracker",
   "short_name": "BoxTracker",
-  "start_url": ".",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#0a0a0a",
   "theme_color": "#0a0a0a",
   "icons": [
-    {
-      "src": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAMAAAADAAQMAAACaYIuSAAAABlBMVEUAAP8AAAD1r8oOAAAASElEQVQYGe3OsQkAMAxE0eUu8f8i1m0g0Jg2Q0cWQmQkJx8p8g4xU3f3cQe2Ckq6j8E8t4JqgJpZC0d9q1xwEAAAAAAAAAALwG2gAAk3m1b6bZ5hQAAAAASUVORK5CYII=",
-      "type": "image/png",
-      "sizes": "192x192"
-    }
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
   ]
 }
