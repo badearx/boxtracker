@@ -15,17 +15,24 @@
       .img-grid img{width:100%; height:112px; object-fit:cover; border-radius:8px}
       .lightbox{position:fixed; inset:0; background:rgba(0,0,0,.92); display:flex; align-items:center; justify-content:center; z-index:60}
       .lightbox img{max-width:100vw; max-height:100vh; object-fit:contain}
+      .pill{padding:6px 10px;border:1px solid #2a2a2a;border-radius:9999px;background:#151515;color:#ddd;font-size:12px}
+      .modal{position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center}
+      .modal > .back{position:absolute; inset:0; background:rgba(0,0,0,.6)}
+      .modal > .card{position:relative; width:min(560px,92vw); background:#0b0b0b; border:1px solid #262626; border-radius:16px; padding:16px}
     </style>
-    <!-- React + Babel (no build tools) -->
+    <!-- React + Babel + MSAL (no build tools) -->
     <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   </head>
   <body>
     <div id="root"></div>
 
     <script type="text/babel">
-      // ===== IndexedDB helpers =====
+      // =========================
+      //  IndexedDB helpers
+      // =========================
       const DB_NAME = 'boxtracker_db';
       const DB_VERSION = 1;
       const STORE = 'boxes';
@@ -60,64 +67,261 @@
           r.onerror = ()=>reject(r.error);
         });
       }
-      async function dbDelete(id){
-        const db = await openDB();
-        return new Promise((resolve,reject)=>{
-          const tx = db.transaction(STORE,'readwrite');
-          const s = tx.objectStore(STORE);
-          const r = s.delete(id);
-          r.onsuccess = ()=>resolve(true);
-          r.onerror = ()=>reject(r.error);
-        });
+
+      // Soft delete: keep tombstones for sync
+      async function dbSoftDelete(id){
+        const all = await dbGetAll();
+        const target = all.find(x=>x.id===id);
+        if(!target) return;
+        const now = Date.now();
+        const tomb = { ...target, deletedAt: now, updatedAt: now };
+        await dbPut(tomb);
       }
 
-      // ===== Utilities =====
+      // =========================
+      //  Utilities
+      // =========================
       const uid = ()=> Math.random().toString(36).slice(2)+Date.now().toString(36);
       const Placeholder = () => `data:image/svg+xml;utf8,${encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 800 450'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#1f1f1f'/><stop offset='100%' stop-color='#2a2a2a'/></linearGradient></defs><rect width='800' height='450' fill='url(#g)'/><text x='50%' y='50%' fill='#666' font-size='32' text-anchor='middle' dominant-baseline='middle' font-family='system-ui'>No photo</text></svg>")}`;
       const fileToDataUrl = (file)=> new Promise((res,rej)=>{ const rd=new FileReader(); rd.onload=()=>res(rd.result); rd.onerror=()=>rej(rd.error); rd.readAsDataURL(file); });
 
-      // ===== Styles =====
-      const btnPrimary = { padding:'12px 16px', borderRadius:14, background:'#7c3aed', color:'#fff', fontWeight:700, border:'1px solid #6d28d9' };
-      const btnGhost   = { padding:'12px 16px', borderRadius:14, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a', fontWeight:600 };
-      const btnGhostSm = { ...btnGhost, padding:'9px 12px', fontSize:13 };
-      const btnPrimarySm = { ...btnPrimary, padding:'9px 12px', fontSize:13 };
-      const btnDangerSm = { ...btnGhostSm, border:'1px solid #7f1d1d' };
-      const inputStyle = { width:'100%', borderRadius:14, background:'#111', border:'1px solid #262626', padding:'14px 16px', outline:'none', color:'#f5f5f5' };
-      const textareaStyle = { ...inputStyle, minHeight:96, resize:'vertical' };
+      async function compressToJpegDataUrl(file, maxDim=1600, quality=0.8){
+        const imgUrl = URL.createObjectURL(file);
+        try {
+          const img = await new Promise((resolve, reject) => {
+            const im = new Image();
+            im.onload = () => resolve(im);
+            im.onerror = reject;
+            im.src = imgUrl;
+          });
+          const w = img.width, h = img.height;
+          const scale = Math.min(1, maxDim / Math.max(w, h));
+          const cw = Math.round(w * scale), ch = Math.round(h * scale);
+          const canvas = document.createElement('canvas');
+          canvas.width = cw; canvas.height = ch;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, cw, ch);
+          // Convert to JPEG; browsers that don't support JPEG will fallback to PNG data URL
+          const dataUrl = canvas.toDataURL('image/jpeg', quality);
+          return dataUrl;
+        } finally {
+          URL.revokeObjectURL(imgUrl);
+        }
+      }
 
-      // ===== App =====
+      function ts(rec){ return Math.max(rec.updatedAt || 0, rec.deletedAt || 0); }
+
+      // =========================
+      //  Microsoft Graph (OneDrive/SharePoint)
+      // =========================
+      const GRAPH = 'https://graph.microsoft.com/v1.0';
+      const GRAPH_SCOPES = ['Files.ReadWrite', 'offline_access'];
+
+      const MSAL_CONFIG = {
+        clientId: 'de0b7ce9-ac79-4043-a534-041e72cab5a2', // TODO: set yours
+        authority: 'https://login.microsoftonline.com/b4ccf74c-7f14-496f-8948-ebac34f6cf1e', // e.g., common or your tenant GUID
+        redirectUri: window.location.origin + window.location.pathname,
+      };
+
+      function useMSAL(){
+        const [instance] = React.useState(()=> new msal.PublicClientApplication({ auth: MSAL_CONFIG, cache: { cacheLocation: 'localStorage' } }));
+        const [account, setAccount] = React.useState(null);
+        React.useEffect(()=>{
+          instance.handleRedirectPromise().then(() => {
+            const accs = instance.getAllAccounts();
+            if(accs.length){ instance.setActiveAccount(accs[0]); setAccount(accs[0]); }
+          });
+        },[instance]);
+
+        async function signIn(){
+          const res = await instance.loginPopup({ scopes: GRAPH_SCOPES });
+          instance.setActiveAccount(res.account); setAccount(res.account);
+        }
+        async function signOut(){
+          const acc = instance.getActiveAccount();
+          if(acc) await instance.logoutPopup({ account: acc });
+          setAccount(null);
+        }
+        async function token(){
+          const acc = instance.getActiveAccount();
+          if(!acc) throw new Error('Not signed in');
+          try {
+            const res = await instance.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: acc });
+            return res.accessToken;
+          } catch{
+            const res = await instance.acquireTokenPopup({ scopes: GRAPH_SCOPES });
+            return res.accessToken;
+          }
+        }
+        return { account, signIn, signOut, token };
+      }
+
+      async function ensureFolderOneDrive(token){
+        // Create /BoxTracker folder if missing
+        const url = `${GRAPH}/me/drive/root/children`;
+        const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+        const data = await r.json();
+        const exists = Array.isArray(data.value) && data.value.some(it => it.name === 'BoxTracker' && it.folder);
+        if(!exists){
+          await fetch(url, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: 'BoxTracker', folder: {}, '@microsoft.graph.conflictBehavior': 'fail' })
+          });
+        }
+      }
+
+      async function uploadJSONOneDrive(token, text){
+        await ensureFolderOneDrive(token);
+        const url = `${GRAPH}/me/drive/root:/BoxTracker/boxes.json:/content`;
+        const r = await fetch(url, { method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: text });
+        if(!r.ok) throw new Error('Upload failed: ' + r.status);
+      }
+
+      async function downloadJSONOneDrive(token){
+        const url = `${GRAPH}/me/drive/root:/BoxTracker/boxes.json:/content`;
+        const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+        if(r.status === 404) return null; // first time
+        if(!r.ok) throw new Error('Download failed: ' + r.status);
+        return await r.json();
+      }
+
+      // (Optional) SharePoint helpers — requires site URL like https://contoso.sharepoint.com/sites/MySite
+      async function getSiteAndDrive(token, siteUrl){
+        try{
+          const u = new URL(siteUrl);
+          const hostname = u.hostname; // contoso.sharepoint.com
+          const path = u.pathname;     // /sites/MySite
+          const siteRes = await fetch(`${GRAPH}/sites/${hostname}:${path}`, { headers: { Authorization: `Bearer ${token}` } });
+          if(!siteRes.ok) throw new Error('Site lookup failed');
+          const site = await siteRes.json();
+          const driveRes = await fetch(`${GRAPH}/sites/${site.id}/drive`, { headers: { Authorization: `Bearer ${token}` } });
+          if(!driveRes.ok) throw new Error('Drive lookup failed');
+          const drive = await driveRes.json();
+          return { siteId: site.id, driveId: drive.id };
+        } catch(e){ throw e; }
+      }
+      async function uploadJSONSharePoint(token, siteUrl, text){
+        const { siteId, driveId } = await getSiteAndDrive(token, siteUrl);
+        const url = `${GRAPH}/sites/${siteId}/drives/${driveId}/root:/BoxTracker/boxes.json:/content`;
+        const r = await fetch(url, { method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: text });
+        if(!r.ok) throw new Error('SP upload failed: ' + r.status);
+      }
+      async function downloadJSONSharePoint(token, siteUrl){
+        const { siteId, driveId } = await getSiteAndDrive(token, siteUrl);
+        const url = `${GRAPH}/sites/${siteId}/drives/${driveId}/root:/BoxTracker/boxes.json:/content`;
+        const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+        if(r.status === 404) return null;
+        if(!r.ok) throw new Error('SP download failed: ' + r.status);
+        return await r.json();
+      }
+
+      // =========================
+      //  App
+      // =========================
       function App(){
+        const { account, signIn, signOut, token } = useMSAL();
+
         const [boxes,setBoxes] = React.useState([]);
         const [query,setQuery] = React.useState('');
         const [sheetOpen,setSheetOpen] = React.useState(false);
         const [editing,setEditing] = React.useState(null);
         const [busy,setBusy] = React.useState(false);
+        const [settingsOpen, setSettingsOpen] = React.useState(false);
+        const [autoSync, setAutoSync] = React.useState(()=> localStorage.getItem('bt_autoSync') === '1');
+        const [target, setTarget] = React.useState(()=> localStorage.getItem('bt_target') || 'onedrive'); // 'onedrive' | 'sharepoint'
+        const [spSiteUrl, setSpSiteUrl] = React.useState(()=> localStorage.getItem('bt_spSiteUrl') || '');
 
-        React.useEffect(()=>{ (async()=>{ const all = await dbGetAll(); all.sort((a,b)=>b.updatedAt-a.updatedAt); setBoxes(all); })(); },[]);
+        React.useEffect(()=>{ (async()=>{ const all = await dbGetAll(); all.sort((a,b)=> ts(b)-ts(a)); setBoxes(all); })(); },[]);
+
+        React.useEffect(()=>{ localStorage.setItem('bt_autoSync', autoSync ? '1' : '0'); },[autoSync]);
+        React.useEffect(()=>{ localStorage.setItem('bt_target', target); },[target]);
+        React.useEffect(()=>{ localStorage.setItem('bt_spSiteUrl', spSiteUrl); },[spSiteUrl]);
+
+        function visible(list){ return list.filter(b => !b.deletedAt); }
 
         async function saveBox(item){
           const now = Date.now();
           const payload = { ...item, updatedAt: now, id: item.id || uid(), createdAt: item.createdAt || now };
           await dbPut(payload);
-          setBoxes(prev=>{ const exists = prev.some(x=>x.id===payload.id); const next = exists ? prev.map(x=>x.id===payload.id?payload:x) : [payload,...prev]; next.sort((a,b)=>b.updatedAt-a.updatedAt); return next; });
+          setBoxes(prev=>{ const exists = prev.some(x=>x.id===payload.id); const next = exists ? prev.map(x=>x.id===payload.id?payload:x) : [payload,...prev]; next.sort((a,b)=> ts(b)-ts(a)); return next; });
+          if(account && autoSync){ try{ await syncNow('merge'); } catch(e){ console.warn('Auto-sync failed', e); } }
         }
-        async function removeBox(id){ await dbDelete(id); setBoxes(prev=>prev.filter(x=>x.id!==id)); }
+        async function removeBox(id){
+          await dbSoftDelete(id);
+          const all = await dbGetAll();
+          all.sort((a,b)=> ts(b)-ts(a));
+          setBoxes(all);
+          if(account && autoSync){ try{ await syncNow('merge'); } catch(e){ console.warn('Auto-sync failed', e); } }
+        }
 
         const filtered = React.useMemo(()=>{
-          if(!query.trim()) return boxes;
+          const list = visible(boxes);
+          if(!query.trim()) return list;
           const q = query.toLowerCase();
-          return boxes.filter(b=> [b.title,b.description,b.location,b.category].filter(Boolean).some(t=> String(t).toLowerCase().includes(q)) );
+          return list.filter(b=> [b.title,b.description,b.location,b.category].filter(Boolean).some(t=> String(t).toLowerCase().includes(q)) );
         },[boxes,query]);
 
         function onCreate(){ setEditing({ id: uid(), title:'', description:'', location:'', category:'', images:[], createdAt: Date.now(), updatedAt: Date.now() }); setSheetOpen(true); }
         function onEdit(item){ setEditing(JSON.parse(JSON.stringify(item))); setSheetOpen(true); }
 
+        // Local backup
         function exportJSON(){ try{ setBusy(true); const blob = new Blob([JSON.stringify(boxes,null,2)],{type:'application/json'}); const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download = `BoxTracker_Backup_${new Date().toISOString().slice(0,10)}.json`; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); } finally{ setBusy(false); } }
-        async function importJSON(file){ try{ setBusy(true); const text = await file.text(); const imported = JSON.parse(text); if(!Array.isArray(imported)) throw new Error('Invalid backup format'); for(const box of imported) await dbPut(box); const all = await dbGetAll(); all.sort((a,b)=>b.updatedAt-a.updatedAt); setBoxes(all); alert('Import complete.'); } catch(e){ alert('Import failed: '+(e&&e.message?e.message:e)); } finally{ setBusy(false); } }
+        async function importJSON(file){ try{ setBusy(true); const text = await file.text(); const imported = JSON.parse(text); if(!Array.isArray(imported)) throw new Error('Invalid backup format'); for(const box of imported) await dbPut(box); const all = await dbGetAll(); all.sort((a,b)=> ts(b)-ts(a)); setBoxes(all); alert('Import complete.'); } catch(e){ alert('Import failed: '+(e&&e.message?e.message:e)); } finally{ setBusy(false); } }
+
+        async function syncNow(strategy='merge'){ // 'merge' or 'pushLocal'
+          if(!account) throw new Error('Sign in first');
+          setBusy(true);
+          try{
+            const at = await token();
+            let remote = null;
+            if(target==='onedrive') remote = await downloadJSONOneDrive(at);
+            else if(target==='sharepoint' && spSiteUrl) remote = await downloadJSONSharePoint(at, spSiteUrl);
+
+            const local = boxes;
+            let merged = [];
+            if(!remote) {
+              merged = local;
+            } else if(strategy==='pushLocal') {
+              merged = local;
+            } else {
+              // Merge by id, prefer newer updatedAt/deletedAt
+              const map = new Map();
+              for(const r of remote) map.set(r.id, r);
+              for(const l of local){
+                const r = map.get(l.id);
+                if(!r) { map.set(l.id, l); continue; }
+                map.set(l.id, ts(l) >= ts(r) ? l : r);
+              }
+              // include any remote-only ids not present locally already handled above
+              merged = Array.from(map.values());
+            }
+
+            // Write to DB, keep tombstones but hide in UI
+            for(const m of merged) await dbPut(m);
+            const all = await dbGetAll(); all.sort((a,b)=> ts(b)-ts(a)); setBoxes(all);
+
+            const text = JSON.stringify(merged, null, 2);
+            if(target==='onedrive') await uploadJSONOneDrive(at, text);
+            else if(target==='sharepoint' && spSiteUrl) await uploadJSONSharePoint(at, text);
+            alert('Sync complete');
+          } finally {
+            setBusy(false);
+          }
+        }
 
         return (
           <div style={{minHeight:'100vh', background:'#0a0a0a', color:'#f5f5f5'}}>
-            <TopBar query={query} setQuery={setQuery} onCreate={onCreate} onExport={exportJSON} onImport={importJSON} busy={busy} />
+            <TopBar
+              query={query} setQuery={setQuery}
+              onCreate={onCreate}
+              onExport={exportJSON} onImport={importJSON}
+              busy={busy}
+              onOpenSettings={()=> setSettingsOpen(true)}
+              account={account} signIn={signIn} signOut={signOut}
+              onSync={()=> syncNow('merge')}
+            />
+
             <div style={{maxWidth:960, margin:'0 auto', padding:16, paddingBottom:96}}>
               {filtered.length===0 ? <EmptyState onCreate={onCreate}/> : (
                 <div style={{display:'grid', gap:12}}>
@@ -125,6 +329,7 @@
                 </div>
               )}
             </div>
+
             {sheetOpen && editing && (
               <EditorSheet
                 item={editing}
@@ -133,24 +338,42 @@
                 onDelete={async(id)=>{ if(confirm('Delete this box?')){ await removeBox(id); setSheetOpen(false); setEditing(null);} }}
               />
             )}
+
+            {settingsOpen && (
+              <SettingsModal
+                onClose={()=> setSettingsOpen(false)}
+                autoSync={autoSync} setAutoSync={setAutoSync}
+                target={target} setTarget={setTarget}
+                spSiteUrl={spSiteUrl} setSpSiteUrl={setSpSiteUrl}
+                account={account} signIn={signIn} signOut={signOut}
+              />
+            )}
           </div>
         );
       }
 
-      function TopBar({query,setQuery,onCreate,onExport,onImport,busy}){
+      function TopBar({query,setQuery,onCreate,onExport,onImport,busy,onOpenSettings,account,signIn,signOut,onSync}){
         const fileRef = React.useRef(null);
         return (
           <div style={{position:'sticky', top:0, zIndex:20, backdropFilter:'blur(8px)', background:'rgba(15,15,15,0.9)', borderBottom:'1px solid #262626'}}>
             <div style={{maxWidth:960, margin:'0 auto', padding:'12px 16px', display:'flex', alignItems:'center', gap:12}}>
               <span style={{fontWeight:700}}>BoxTracker</span>
               <div style={{flex:1}} />
-              <button className="touch-target" onClick={onCreate} style={btnPrimary}>New</button>
-              <button className="touch-target" onClick={onExport} disabled={busy} style={btnGhost}>{busy?'Exporting…':'Export'}</button>
-              <button className="touch-target" onClick={()=> fileRef.current && fileRef.current.click()} disabled={busy} style={btnGhost}>Import</button>
+              {account ? (
+                <span className="pill">{account.username}</span>
+              ) : (
+                <button className="touch-target" onClick={signIn} style={{ padding:'8px 10px', borderRadius:12, background:'#111', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Sign in</button>
+              )}
+              {account && <button className="touch-target" onClick={onSync} style={{ padding:'10px 14px', borderRadius:12, background:'#0f172a', color:'#e5e5e5', border:'1px solid #1f2937' }}>Sync now</button>}
+              {account && <button className="touch-target" onClick={signOut} style={{ padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Sign out</button>}
+              <button className="touch-target" onClick={onOpenSettings} style={{ padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Settings</button>
+              <button className="touch-target" onClick={onCreate} style={{ padding:'10px 14px', borderRadius:12, background:'#6d28d9', color:'#fff', fontWeight:700, border:'1px solid #5b21b6' }}>New</button>
+              <button className="touch-target" onClick={onExport} disabled={busy} style={{ padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>{busy?'Exporting…':'Export'}</button>
+              <button className="touch-target" onClick={()=> fileRef.current && fileRef.current.click()} disabled={busy} style={{ padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Import</button>
               <input ref={fileRef} type="file" accept="application/json,.json" style={{display:'none'}} onChange={(e)=>{ const f=e.target.files&&e.target.files[0]; if(f) onImport(f); e.target.value=''; }} />
             </div>
             <div style={{maxWidth:960, margin:'0 auto', padding:'0 16px 12px'}}>
-              <input value={query} onChange={(e)=>setQuery(e.target.value)} placeholder="Search title, description, location, or category…" style={inputStyle} />
+              <input value={query} onChange={(e)=>setQuery(e.target.value)} placeholder="Search title, description, location, or category…" style={{ width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', outline:'none', color:'#f5f5f5' }} />
             </div>
           </div>
         );
@@ -164,7 +387,7 @@
               <div style={{fontWeight:600, fontSize:18}}>No boxes yet</div>
               <div style={{color:'#a3a3a3'}}>Tap New to add your first storage box.</div>
             </div>
-            <button className="touch-target" onClick={onCreate} style={btnPrimary}>New box</button>
+            <button className="touch-target" onClick={onCreate} style={{ padding:'10px 14px', borderRadius:12, background:'#6d28d9', color:'#fff', fontWeight:700, border:'1px solid #5b21b6' }}>New box</button>
           </div>
         );
       }
@@ -187,8 +410,8 @@
                   </div>
                 </div>
                 <div style={{display:'flex', gap:8}}>
-                  <button className="touch-target" onClick={onOpen} style={btnGhostSm}>Open</button>
-                  <button className="touch-target" onClick={()=> confirm('Delete this box? This cannot be undone.') && onDelete()} style={btnDangerSm}>Delete</button>
+                  <button className="touch-target" onClick={onOpen} style={{ padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Open</button>
+                  <button className="touch-target" onClick={()=> confirm('Delete this box? This cannot be undone.') && onDelete()} style={{ padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #7f1d1d' }}>Delete</button>
                 </div>
               </div>
             </div>
@@ -203,44 +426,43 @@
         const galRef = React.useRef(null);
 
         function setField(k,v){ setVal(prev=>({...prev,[k]:v})); }
-        async function onFiles(files){ if(!files||!files.length) return; const arr=[]; for(const f of Array.from(files)){ const dataUrl = await fileToDataUrl(f); arr.push({id:uid(), dataUrl, createdAt: Date.now()}); } setVal(prev=>({...prev, images:[...arr, ...(prev.images||[])]})); }
+        async function onFiles(files){ if(!files||!files.length) return; const arr=[]; for(const f of Array.from(files)){ const dataUrl = await compressToJpegDataUrl(f, 1600, 0.8); arr.push({id:uid(), dataUrl, createdAt: Date.now()}); } setVal(prev=>({...prev, images:[...arr, ...(prev.images||[])]})); }
 
         return (
           <div style={{position:'fixed', inset:0, zIndex:30}}>
             <div onClick={onClose} style={{position:'absolute', inset:0, background:'rgba(0,0,0,0.6)'}} />
             <div style={{position:'absolute', right:0, top:0, bottom:0, width:'min(560px,100%)', background:'#0b0b0b', borderLeft:'1px solid #262626'}}>
               <div style={{padding:12, display:'flex', alignItems:'center', gap:8, borderBottom:'1px solid #262626'}}>
-                <button className="touch-target" onClick={onClose} style={btnGhostSm}>Close</button>
+                <button className="touch-target" onClick={onClose} style={{ padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Close</button>
                 <div style={{flex:1, textAlign:'center', fontWeight:600}}>Edit Box</div>
-                <button className="touch-target" onClick={()=>{ if(!val.title.trim() && !confirm('Title is empty. Save anyway?')) return; onSave(val); }} style={btnPrimarySm}>Save</button>
+                <button className="touch-target" onClick={()=>{ if(!val.title.trim() && !confirm('Title is empty. Save anyway?')) return; onSave(val); }} style={{ padding:'8px 10px', borderRadius:12, background:'#6d28d9', color:'#fff', fontWeight:700, border:'1px solid #5b21b6' }}>Save</button>
               </div>
 
               <div style={{padding:16, overflowY:'auto', height:'calc(100% - 56px)'}}>
                 <label style={{display:'block', marginBottom:12}}>
                   <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>Title</div>
-                  <input value={val.title} onChange={(e)=>setField('title', e.target.value)} placeholder="e.g., Winter clothes" style={inputStyle} />
+                  <input value={val.title} onChange={(e)=>setField('title', e.target.value)} placeholder="e.g., Winter clothes" style={{ width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', outline:'none', color:'#f5f5f5' }} />
                 </label>
                 <label style={{display:'block', marginBottom:12}}>
                   <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>Description</div>
-                  <textarea value={val.description} onChange={(e)=>setField('description', e.target.value)} placeholder="Optional notes about what’s inside" rows="3" style={textareaStyle}></textarea>
+                  <textarea value={val.description} onChange={(e)=>setField('description', e.target.value)} placeholder="Optional notes about what’s inside" rows="3" style={{ width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', outline:'none', color:'#f5f5f5', minHeight:96, resize:'vertical' }}></textarea>
                 </label>
                 <div style={{display:'grid', gap:12, gridTemplateColumns:'1fr 1fr'}}>
                   <label style={{display:'block'}}>
                     <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>Location</div>
-                    <input value={val.location} onChange={(e)=>setField('location', e.target.value)} placeholder="e.g., Garage shelf A" style={inputStyle} />
+                    <input value={val.location} onChange={(e)=>setField('location', e.target.value)} placeholder="e.g., Garage shelf A" style={{ width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', outline:'none', color:'#f5f5f5' }} />
                   </label>
                   <label style={{display:'block'}}>
                     <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>Category</div>
-                    <input value={val.category} onChange={(e)=>setField('category', e.target.value)} placeholder="e.g., Clothing, Tools, Seasonal" style={inputStyle} />
+                    <input value={val.category} onChange={(e)=>setField('category', e.target.value)} placeholder="e.g., Clothing, Tools, Seasonal" style={{ width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', outline:'none', color:'#f5f5f5' }} />
                   </label>
                 </div>
 
                 <div style={{marginTop:8}}>
                   <div style={{fontSize:13, fontWeight:700, color:'#e5e5e5', marginBottom:8}}>Photos</div>
-                  {/* Bigger, easier capture buttons */}
                   <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12}}>
-                    <button className="touch-target" onClick={()=> camRef.current && camRef.current.click()} style={btnPrimary}>📷 Take photo</button>
-                    <button className="touch-target" onClick={()=> galRef.current && galRef.current.click()} style={btnGhost}>🖼️ From gallery</button>
+                    <button className="touch-target" onClick={()=> camRef.current && camRef.current.click()} style={{ padding:'12px 16px', borderRadius:14, background:'#7c3aed', color:'#fff', fontWeight:700, border:'1px solid #6d28d9' }}>📷 Take photo</button>
+                    <button className="touch-target" onClick={()=> galRef.current && galRef.current.click()} style={{ padding:'12px 16px', borderRadius:14, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a', fontWeight:600 }}>🖼️ From gallery</button>
                     <input ref={camRef} type="file" accept="image/*" capture="environment" multiple style={{display:'none'}} onChange={(e)=> onFiles(e.target.files)} />
                     <input ref={galRef} type="file" accept="image/*" multiple style={{display:'none'}} onChange={(e)=> onFiles(e.target.files)} />
                   </div>
@@ -254,7 +476,7 @@
                           <button onClick={()=> setLightbox({src: img.dataUrl, idx})} style={{padding:0, border:'none', background:'transparent', display:'block', width:'100%'}}>
                             <img src={img.dataUrl} alt="box" />
                           </button>
-                          <button className="touch-target" onClick={()=> setVal(prev=>({...prev, images: prev.images.filter(x=>x.id!==img.id)}))} style={{position:'absolute', top:6, right:6, background:'rgba(0,0,0,0.6)', border:'1px solid #2a2a2a', color:'#f5f5f5', borderRadius:8, padding:'2px 8px', fontSize:12}}>×</button>
+                          <button className="touch-target" onClick={()=> { if(confirm('Remove this photo?')) setVal(prev=>({...prev, images: prev.images.filter(x=>x.id!==img.id)})); }} style={{position:'absolute', top:6, right:6, background:'rgba(0,0,0,0.6)', border:'1px solid #2a2a2a', color:'#f5f5f5', borderRadius:8, padding:'2px 8px', fontSize:12}}>×</button>
                         </div>
                       ))}
                     </div>
@@ -262,7 +484,7 @@
                 </div>
 
                 <div style={{display:'flex', gap:12, marginTop:16}}>
-                  <button className="touch-target" onClick={()=>{ if(confirm('Delete this box?')) onDelete(val.id); }} style={btnDangerSm}>Delete box</button>
+                  <button className="touch-target" onClick={()=>{ if(confirm('Delete this box?')) onDelete(val.id); }} style={{ padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #7f1d1d' }}>Delete box</button>
                 </div>
 
                 <div style={{fontSize:12, color:'#8a8a8a', marginTop:12}}>
@@ -275,6 +497,60 @@
                   <img src={lightbox.src} alt="full" />
                 </div>
               )}
+            </div>
+          </div>
+        );
+      }
+
+      function SettingsModal({ onClose, autoSync, setAutoSync, target, setTarget, spSiteUrl, setSpSiteUrl, account, signIn, signOut }){
+        return (
+          <div className="modal">
+            <div className="back" onClick={onClose}></div>
+            <div className="card">
+              <div style={{display:'flex', alignItems:'center', marginBottom:12}}>
+                <div style={{fontWeight:700, fontSize:18}}>Settings</div>
+                <div style={{flex:1}}></div>
+                <button onClick={onClose} style={{ padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Close</button>
+              </div>
+
+              <div style={{display:'grid', gap:12}}>
+                <div style={{display:'flex', alignItems:'center', gap:8}}>
+                  <div style={{fontWeight:600}}>Sign in</div>
+                  <div style={{flex:1}}></div>
+                  {account ? (
+                    <>
+                      <span className="pill">{account.username}</span>
+                      <button onClick={signOut} style={{ padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Sign out</button>
+                    </>
+                  ) : (
+                    <button onClick={signIn} style={{ padding:'8px 10px', borderRadius:12, background:'#111', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Sign in with Microsoft</button>
+                  )}
+                </div>
+
+                <label style={{display:'block'}}>
+                  <div style={{fontWeight:600, marginBottom:6}}>Sync target</div>
+                  <select value={target} onChange={(e)=> setTarget(e.target.value)} style={{ width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', color:'#f5f5f5' }}>
+                    <option value="onedrive">OneDrive (recommended)</option>
+                    <option value="sharepoint">SharePoint (advanced)</option>
+                  </select>
+                </label>
+
+                {target==='sharepoint' && (
+                  <label style={{display:'block'}}>
+                    <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>SharePoint Site URL (e.g., https://contoso.sharepoint.com/sites/MySite)</div>
+                    <input value={spSiteUrl} onChange={(e)=> setSpSiteUrl(e.target.value)} placeholder="https://.../sites/YourSite" style={{ width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', outline:'none', color:'#f5f5f5' }} />
+                  </label>
+                )}
+
+                <label style={{display:'flex', alignItems:'center', gap:10}}>
+                  <input type="checkbox" checked={autoSync} onChange={(e)=> setAutoSync(e.target.checked)} />
+                  <span>Auto-sync after each save/delete</span>
+                </label>
+
+                <div style={{fontSize:12, color:'#aaa'}}>
+                  Tip: Sync writes/reads a <code>BoxTracker/boxes.json</code> in your OneDrive or SharePoint document library.
+                </div>
+              </div>
             </div>
           </div>
         );
