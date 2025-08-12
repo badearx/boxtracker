@@ -20,7 +20,7 @@
       .modal > .back{position:absolute; inset:0; background:rgba(0,0,0,.6)}
       .modal > .card{position:relative; width:min(560px,92vw); background:#0b0b0b; border:1px solid #262626; border-radius:16px; padding:16px}
     </style>
-    <!-- React + Babel + MSAL (no build tools) -->
+    <!-- React + Babel + MSAL -->
     <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
@@ -64,11 +64,9 @@
           const s = tx.objectStore(STORE);
           const r = s.put(item);
           r.onsuccess = ()=>resolve(true);
-          r.onerror = ()=>reject(r.error);
+          r.onerror = ()=>reject(req.error);
         });
       }
-
-      // Soft delete: keep tombstones for sync
       async function dbSoftDelete(id){
         const all = await dbGetAll();
         const target = all.find(x=>x.id===id);
@@ -83,7 +81,6 @@
       // =========================
       const uid = ()=> Math.random().toString(36).slice(2)+Date.now().toString(36);
       const Placeholder = () => `data:image/svg+xml;utf8,${encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 800 450'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='#1f1f1f'/><stop offset='100%' stop-color='#2a2a2a'/></linearGradient></defs><rect width='800' height='450' fill='url(#g)'/><text x='50%' y='50%' fill='#666' font-size='32' text-anchor='middle' dominant-baseline='middle' font-family='system-ui'>No photo</text></svg>")}`;
-      const fileToDataUrl = (file)=> new Promise((res,rej)=>{ const rd=new FileReader(); rd.onload=()=>res(rd.result); rd.onerror=()=>rej(rd.error); rd.readAsDataURL(file); });
 
       async function compressToJpegDataUrl(file, maxDim=1600, quality=0.8){
         const imgUrl = URL.createObjectURL(file);
@@ -101,9 +98,7 @@
           canvas.width = cw; canvas.height = ch;
           const ctx = canvas.getContext('2d');
           ctx.drawImage(img, 0, 0, cw, ch);
-          // Convert to JPEG; browsers that don't support JPEG will fallback to PNG data URL
-          const dataUrl = canvas.toDataURL('image/jpeg', quality);
-          return dataUrl;
+          return canvas.toDataURL('image/jpeg', quality);
         } finally {
           URL.revokeObjectURL(imgUrl);
         }
@@ -115,31 +110,38 @@
       //  Microsoft Graph (OneDrive/SharePoint)
       // =========================
       const GRAPH = 'https://graph.microsoft.com/v1.0';
-      const GRAPH_SCOPES = ['Files.ReadWrite', 'offline_access'];
+      const GRAPH_SCOPES = ['Files.ReadWrite', 'openid', 'profile', 'offline_access'];
 
       const MSAL_CONFIG = {
-        clientId: 'de0b7ce9-ac79-4043-a534-041e72cab5a2', // TODO: set yours
-        authority: 'https://login.microsoftonline.com/b4ccf74c-7f14-496f-8948-ebac34f6cf1e', // e.g., common or your tenant GUID
-        redirectUri: window.location.origin + window.location.pathname,
+        auth: {
+          clientId: 'de0b7ce9-ac79-4043-a534-041e72cab5a2',
+          authority: 'https://login.microsoftonline.com/b4ccf74c-7f14-496f-8948-ebac34f6cf1e',
+          redirectUri: window.location.origin + window.location.pathname
+        },
+        cache: { cacheLocation: 'localStorage' }
       };
 
       function useMSAL(){
-        const [instance] = React.useState(()=> new msal.PublicClientApplication({ auth: MSAL_CONFIG, cache: { cacheLocation: 'localStorage' } }));
+        const [instance] = React.useState(()=> new msal.PublicClientApplication(MSAL_CONFIG));
         const [account, setAccount] = React.useState(null);
+
         React.useEffect(()=>{
           instance.handleRedirectPromise().then(() => {
             const accs = instance.getAllAccounts();
             if(accs.length){ instance.setActiveAccount(accs[0]); setAccount(accs[0]); }
-          });
-        },[instance]);
+          }).catch(err=> console.error('MSAL redirect error', err));
+        }, [instance]);
 
         async function signIn(){
-          const res = await instance.loginPopup({ scopes: GRAPH_SCOPES });
-          instance.setActiveAccount(res.account); setAccount(res.account);
+          try{
+            await instance.loginRedirect({ scopes: GRAPH_SCOPES });
+          } catch(e){
+            console.error('loginRedirect failed', e);
+          }
         }
         async function signOut(){
           const acc = instance.getActiveAccount();
-          if(acc) await instance.logoutPopup({ account: acc });
+          if(acc){ await instance.logoutRedirect({ account: acc }); }
           setAccount(null);
         }
         async function token(){
@@ -149,15 +151,19 @@
             const res = await instance.acquireTokenSilent({ scopes: GRAPH_SCOPES, account: acc });
             return res.accessToken;
           } catch{
-            const res = await instance.acquireTokenPopup({ scopes: GRAPH_SCOPES });
-            return res.accessToken;
+            // As a fallback in normal browser (not installed PWA), try popup.
+            try{ const res = await instance.acquireTokenPopup({ scopes: GRAPH_SCOPES }); return res.accessToken; }
+            catch(e){
+              // Final fallback: trigger redirect to refresh tokens
+              await instance.acquireTokenRedirect({ scopes: GRAPH_SCOPES });
+              throw new Error('Redirecting for token');
+            }
           }
         }
         return { account, signIn, signOut, token };
       }
 
       async function ensureFolderOneDrive(token){
-        // Create /BoxTracker folder if missing
         const url = `${GRAPH}/me/drive/root/children`;
         const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
         const data = await r.json();
@@ -181,25 +187,22 @@
       async function downloadJSONOneDrive(token){
         const url = `${GRAPH}/me/drive/root:/BoxTracker/boxes.json:/content`;
         const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-        if(r.status === 404) return null; // first time
+        if(r.status === 404) return null;
         if(!r.ok) throw new Error('Download failed: ' + r.status);
         return await r.json();
       }
 
-      // (Optional) SharePoint helpers — requires site URL like https://contoso.sharepoint.com/sites/MySite
       async function getSiteAndDrive(token, siteUrl){
-        try{
-          const u = new URL(siteUrl);
-          const hostname = u.hostname; // contoso.sharepoint.com
-          const path = u.pathname;     // /sites/MySite
-          const siteRes = await fetch(`${GRAPH}/sites/${hostname}:${path}`, { headers: { Authorization: `Bearer ${token}` } });
-          if(!siteRes.ok) throw new Error('Site lookup failed');
-          const site = await siteRes.json();
-          const driveRes = await fetch(`${GRAPH}/sites/${site.id}/drive`, { headers: { Authorization: `Bearer ${token}` } });
-          if(!driveRes.ok) throw new Error('Drive lookup failed');
-          const drive = await driveRes.json();
-          return { siteId: site.id, driveId: drive.id };
-        } catch(e){ throw e; }
+        const u = new URL(siteUrl);
+        const hostname = u.hostname; // contoso.sharepoint.com
+        const path = u.pathname;     // /sites/MySite
+        const siteRes = await fetch(`${GRAPH}/sites/${hostname}:${path}`, { headers: { Authorization: `Bearer ${token}` } });
+        if(!siteRes.ok) throw new Error('Site lookup failed');
+        const site = await siteRes.json();
+        const driveRes = await fetch(`${GRAPH}/sites/${site.id}/drive`, { headers: { Authorization: `Bearer ${token}` } });
+        if(!driveRes.ok) throw new Error('Drive lookup failed');
+        const drive = await driveRes.json();
+        return { siteId: site.id, driveId: drive.id };
       }
       async function uploadJSONSharePoint(token, siteUrl, text){
         const { siteId, driveId } = await getSiteAndDrive(token, siteUrl);
@@ -221,7 +224,7 @@
       // =========================
       function App(){
         const { account, signIn, signOut, token } = useMSAL();
-
+        const defaultSp = 'https://squaredqubit.sharepoint.com/sites/BoxTracker';
         const [boxes,setBoxes] = React.useState([]);
         const [query,setQuery] = React.useState('');
         const [sheetOpen,setSheetOpen] = React.useState(false);
@@ -229,11 +232,10 @@
         const [busy,setBusy] = React.useState(false);
         const [settingsOpen, setSettingsOpen] = React.useState(false);
         const [autoSync, setAutoSync] = React.useState(()=> localStorage.getItem('bt_autoSync') === '1');
-        const [target, setTarget] = React.useState(()=> localStorage.getItem('bt_target') || 'onedrive'); // 'onedrive' | 'sharepoint'
-        const [spSiteUrl, setSpSiteUrl] = React.useState(()=> localStorage.getItem('bt_spSiteUrl') || '');
+        const [target, setTarget] = React.useState(()=> localStorage.getItem('bt_target') || 'sharepoint');
+        const [spSiteUrl, setSpSiteUrl] = React.useState(()=> localStorage.getItem('bt_spSiteUrl') || defaultSp);
 
-        React.useEffect(()=>{ (async()=>{ const all = await dbGetAll(); all.sort((a,b)=> ts(b)-ts(a)); setBoxes(all); })(); },[]);
-
+        React.useEffect(()=>{ (async()=>{ const all = await dbGetAll(); all.sort((a,b)=> Math.max((b.updatedAt||0),(b.deletedAt||0)) - Math.max((a.updatedAt||0),(a.deletedAt||0))); setBoxes(all); })(); },[]);
         React.useEffect(()=>{ localStorage.setItem('bt_autoSync', autoSync ? '1' : '0'); },[autoSync]);
         React.useEffect(()=>{ localStorage.setItem('bt_target', target); },[target]);
         React.useEffect(()=>{ localStorage.setItem('bt_spSiteUrl', spSiteUrl); },[spSiteUrl]);
@@ -244,13 +246,13 @@
           const now = Date.now();
           const payload = { ...item, updatedAt: now, id: item.id || uid(), createdAt: item.createdAt || now };
           await dbPut(payload);
-          setBoxes(prev=>{ const exists = prev.some(x=>x.id===payload.id); const next = exists ? prev.map(x=>x.id===payload.id?payload:x) : [payload,...prev]; next.sort((a,b)=> ts(b)-ts(a)); return next; });
+          setBoxes(prev=>{ const exists = prev.some(x=>x.id===payload.id); const next = exists ? prev.map(x=>x.id===payload.id?payload:x) : [payload,...prev]; next.sort((a,b)=> Math.max((b.updatedAt||0),(b.deletedAt||0)) - Math.max((a.updatedAt||0),(a.deletedAt||0))); return next; });
           if(account && autoSync){ try{ await syncNow('merge'); } catch(e){ console.warn('Auto-sync failed', e); } }
         }
         async function removeBox(id){
           await dbSoftDelete(id);
           const all = await dbGetAll();
-          all.sort((a,b)=> ts(b)-ts(a));
+          all.sort((a,b)=> Math.max((b.updatedAt||0),(b.deletedAt||0)) - Math.max((a.updatedAt||0),(a.deletedAt||0)) );
           setBoxes(all);
           if(account && autoSync){ try{ await syncNow('merge'); } catch(e){ console.warn('Auto-sync failed', e); } }
         }
@@ -265,11 +267,10 @@
         function onCreate(){ setEditing({ id: uid(), title:'', description:'', location:'', category:'', images:[], createdAt: Date.now(), updatedAt: Date.now() }); setSheetOpen(true); }
         function onEdit(item){ setEditing(JSON.parse(JSON.stringify(item))); setSheetOpen(true); }
 
-        // Local backup
         function exportJSON(){ try{ setBusy(true); const blob = new Blob([JSON.stringify(boxes,null,2)],{type:'application/json'}); const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download = `BoxTracker_Backup_${new Date().toISOString().slice(0,10)}.json`; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); } finally{ setBusy(false); } }
-        async function importJSON(file){ try{ setBusy(true); const text = await file.text(); const imported = JSON.parse(text); if(!Array.isArray(imported)) throw new Error('Invalid backup format'); for(const box of imported) await dbPut(box); const all = await dbGetAll(); all.sort((a,b)=> ts(b)-ts(a)); setBoxes(all); alert('Import complete.'); } catch(e){ alert('Import failed: '+(e&&e.message?e.message:e)); } finally{ setBusy(false); } }
+        async function importJSON(file){ try{ setBusy(true); const text = await file.text(); const imported = JSON.parse(text); if(!Array.isArray(imported)) throw new Error('Invalid backup format'); for(const box of imported) await dbPut(box); const all = await dbGetAll(); all.sort((a,b)=> Math.max((b.updatedAt||0),(b.deletedAt||0)) - Math.max((a.updatedAt||0),(a.deletedAt||0))); setBoxes(all); alert('Import complete.'); } catch(e){ alert('Import failed: '+(e&&e.message?e.message:e)); } finally{ setBusy(false); } }
 
-        async function syncNow(strategy='merge'){ // 'merge' or 'pushLocal'
+        async function syncNow(strategy='merge'){
           if(!account) throw new Error('Sign in first');
           setBusy(true);
           try{
@@ -285,21 +286,20 @@
             } else if(strategy==='pushLocal') {
               merged = local;
             } else {
-              // Merge by id, prefer newer updatedAt/deletedAt
               const map = new Map();
               for(const r of remote) map.set(r.id, r);
               for(const l of local){
                 const r = map.get(l.id);
                 if(!r) { map.set(l.id, l); continue; }
-                map.set(l.id, ts(l) >= ts(r) ? l : r);
+                const lts = Math.max(l.updatedAt||0, l.deletedAt||0);
+                const rts = Math.max(r.updatedAt||0, r.deletedAt||0);
+                map.set(l.id, lts >= rts ? l : r);
               }
-              // include any remote-only ids not present locally already handled above
               merged = Array.from(map.values());
             }
 
-            // Write to DB, keep tombstones but hide in UI
             for(const m of merged) await dbPut(m);
-            const all = await dbGetAll(); all.sort((a,b)=> ts(b)-ts(a)); setBoxes(all);
+            const all = await dbGetAll(); all.sort((a,b)=> Math.max((b.updatedAt||0),(b.deletedAt||0)) - Math.max((a.updatedAt||0),(a.deletedAt||0))); setBoxes(all);
 
             const text = JSON.stringify(merged, null, 2);
             if(target==='onedrive') await uploadJSONOneDrive(at, text);
@@ -354,18 +354,18 @@
 
       function TopBar({query,setQuery,onCreate,onExport,onImport,busy,onOpenSettings,account,signIn,signOut,onSync}){
         const fileRef = React.useRef(null);
+        const who = account ? (account.name || account.username || 'User') : null;
         return (
           <div style={{position:'sticky', top:0, zIndex:20, backdropFilter:'blur(8px)', background:'rgba(15,15,15,0.9)', borderBottom:'1px solid #262626'}}>
-            <div style={{maxWidth:960, margin:'0 auto', padding:'12px 16px', display:'flex', alignItems:'center', gap:12}}>
+            <div style={{maxWidth:960, margin:'0 auto', padding:'12px 16px', display:'flex', alignItems:'center', gap:12, flexWrap:'wrap'}}>
               <span style={{fontWeight:700}}>BoxTracker</span>
               <div style={{flex:1}} />
-              {account ? (
-                <span className="pill">{account.username}</span>
-              ) : (
+              {who && <span className="pill">Signed in as: {who}</span>}
+              {!who && (
                 <button className="touch-target" onClick={signIn} style={{ padding:'8px 10px', borderRadius:12, background:'#111', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Sign in</button>
               )}
-              {account && <button className="touch-target" onClick={onSync} style={{ padding:'10px 14px', borderRadius:12, background:'#0f172a', color:'#e5e5e5', border:'1px solid #1f2937' }}>Sync now</button>}
-              {account && <button className="touch-target" onClick={signOut} style={{ padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Sign out</button>}
+              {who && <button className="touch-target" onClick={onSync} style={{ padding:'10px 14px', borderRadius:12, background:'#0f172a', color:'#e5e5e5', border:'1px solid #1f2937' }}>Sync now</button>}
+              {who && <button className="touch-target" onClick={signOut} style={{ padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Sign out</button>}
               <button className="touch-target" onClick={onOpenSettings} style={{ padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Settings</button>
               <button className="touch-target" onClick={onCreate} style={{ padding:'10px 14px', borderRadius:12, background:'#6d28d9', color:'#fff', fontWeight:700, border:'1px solid #5b21b6' }}>New</button>
               <button className="touch-target" onClick={onExport} disabled={busy} style={{ padding:'10px 14px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>{busy?'Exporting…':'Export'}</button>
@@ -421,7 +421,7 @@
 
       function EditorSheet({item,onClose,onSave,onDelete}){
         const [val,setVal] = React.useState(item);
-        const [lightbox,setLightbox] = React.useState(null); // {src, idx}
+        const [lightbox,setLightbox] = React.useState(null);
         const camRef = React.useRef(null);
         const galRef = React.useRef(null);
 
@@ -503,23 +503,24 @@
       }
 
       function SettingsModal({ onClose, autoSync, setAutoSync, target, setTarget, spSiteUrl, setSpSiteUrl, account, signIn, signOut }){
+        const who = account ? (account.name || account.username || 'User') : null;
         return (
           <div className="modal">
             <div className="back" onClick={onClose}></div>
             <div className="card">
-              <div style={{display:'flex', alignItems:'center', marginBottom:12}}>
+              <div style={{display:'flex', alignItems:'center', marginBottom:12, gap:8, flexWrap:'wrap'}}>
                 <div style={{fontWeight:700, fontSize:18}}>Settings</div>
                 <div style={{flex:1}}></div>
+                {who && <span className="pill">Signed in as: {who}</span>}
                 <button onClick={onClose} style={{ padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Close</button>
               </div>
 
               <div style={{display:'grid', gap:12}}>
-                <div style={{display:'flex', alignItems:'center', gap:8}}>
-                  <div style={{fontWeight:600}}>Sign in</div>
+                <div style={{display:'flex', alignItems:'center', gap:8, flexWrap:'wrap'}}>
+                  <div style={{fontWeight:600}}>Microsoft account</div>
                   <div style={{flex:1}}></div>
-                  {account ? (
+                  {who ? (
                     <>
-                      <span className="pill">{account.username}</span>
                       <button onClick={signOut} style={{ padding:'8px 10px', borderRadius:12, background:'#171717', color:'#e5e5e5', border:'1px solid #2a2a2a' }}>Sign out</button>
                     </>
                   ) : (
@@ -531,13 +532,13 @@
                   <div style={{fontWeight:600, marginBottom:6}}>Sync target</div>
                   <select value={target} onChange={(e)=> setTarget(e.target.value)} style={{ width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', color:'#f5f5f5' }}>
                     <option value="onedrive">OneDrive (recommended)</option>
-                    <option value="sharepoint">SharePoint (advanced)</option>
+                    <option value="sharepoint">SharePoint</option>
                   </select>
                 </label>
 
                 {target==='sharepoint' && (
                   <label style={{display:'block'}}>
-                    <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>SharePoint Site URL (e.g., https://contoso.sharepoint.com/sites/MySite)</div>
+                    <div style={{fontSize:13, fontWeight:600, color:'#e5e5e5', marginBottom:6}}>SharePoint Site URL</div>
                     <input value={spSiteUrl} onChange={(e)=> setSpSiteUrl(e.target.value)} placeholder="https://.../sites/YourSite" style={{ width:'100%', borderRadius:12, background:'#111', border:'1px solid #262626', padding:'12px 14px', outline:'none', color:'#f5f5f5' }} />
                   </label>
                 )}
@@ -548,7 +549,7 @@
                 </label>
 
                 <div style={{fontSize:12, color:'#aaa'}}>
-                  Tip: Sync writes/reads a <code>BoxTracker/boxes.json</code> in your OneDrive or SharePoint document library.
+                  Sync uses <code>BoxTracker/boxes.json</code> in your OneDrive or the selected SharePoint site.
                 </div>
               </div>
             </div>
